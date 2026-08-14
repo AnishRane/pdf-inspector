@@ -1,5 +1,6 @@
 //! Hyperlink and AcroForm field extraction.
 
+use crate::text_utils::decode_text_string;
 use crate::types::{ItemType, TextItem};
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
@@ -294,7 +295,7 @@ pub(crate) fn walk_form_fields(
         .get(b"T")
         .ok()
         .and_then(|o| o.as_str().ok())
-        .map(|s| String::from_utf8_lossy(s).to_string())
+        .map(decode_text_string)
         .unwrap_or_default();
 
     let full_name = if parent_name.is_empty() {
@@ -367,7 +368,7 @@ pub(crate) fn walk_form_fields(
             // Text or Choice field — value is a string or array of strings
             match value {
                 Object::String(s, _) => {
-                    let s = String::from_utf8_lossy(s).to_string();
+                    let s = decode_text_string(s);
                     if s.is_empty() {
                         return;
                     }
@@ -378,7 +379,7 @@ pub(crate) fn walk_form_fields(
                         .iter()
                         .filter_map(|o| {
                             if let Object::String(s, _) = o {
-                                Some(String::from_utf8_lossy(s).to_string())
+                                Some(decode_text_string(s))
                             } else {
                                 None
                             }
@@ -461,7 +462,92 @@ pub(crate) fn walk_form_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::{dictionary, Object};
+    use lopdf::{dictionary, Object, StringFormat};
+
+    /// Build a PDF text string in UTF-16BE with the leading byte-order mark,
+    /// the encoding ISO 32000-1 7.9.2.2 permits for any text string.
+    fn utf16be(s: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in s.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        bytes
+    }
+
+    fn single_field_doc(name: Object, value: Object) -> (Document, HashMap<ObjectId, u32>) {
+        let mut doc = Document::new();
+        let widget_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Widget",
+            "FT" => "Tx",
+            "T" => name,
+            "V" => value,
+            "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
+        });
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Annots" => vec![Object::Reference(widget_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(widget_id)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, HashMap::from([(page_id, 1)]))
+    }
+
+    #[test]
+    fn utf16be_field_name_decodes_to_plain_text() {
+        // Real IRS forms store `/T` as UTF-16BE. Decoding those bytes as UTF-8
+        // interleaves a NUL between every ASCII character and turns the BOM
+        // into U+FFFD, which is what leaked into extracted Markdown.
+        let (doc, page_map) = single_field_doc(
+            Object::String(
+                utf16be("topmostSubform[0].Page1[0].f1_14[0]"),
+                StringFormat::Literal,
+            ),
+            Object::string_literal("Alice"),
+        );
+
+        let items = extract_form_fields(&doc, &page_map);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "topmostSubform[0].Page1[0].f1_14[0]: Alice");
+    }
+
+    #[test]
+    fn utf16be_field_value_decodes_to_plain_text() {
+        let (doc, page_map) = single_field_doc(
+            Object::string_literal("customer"),
+            Object::String(utf16be("Zoë Ruiz"), StringFormat::Literal),
+        );
+
+        let items = extract_form_fields(&doc, &page_map);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "customer: Zoë Ruiz");
+    }
+
+    #[test]
+    fn decoded_form_fields_carry_no_interior_nul_bytes() {
+        // Guards the downstream symptom: a NUL makes the whole Markdown file
+        // classify as binary, so `grep` and `file` stop treating it as text.
+        let (doc, page_map) = single_field_doc(
+            Object::String(utf16be("f1_59[0]"), StringFormat::Literal),
+            Object::String(utf16be("14,653,649.00"), StringFormat::Literal),
+        );
+
+        let items = extract_form_fields(&doc, &page_map);
+
+        assert_eq!(items.len(), 1);
+        assert!(
+            !items[0].text.contains('\0'),
+            "form field text must not contain NUL: {:?}",
+            items[0].text
+        );
+    }
 
     #[test]
     fn widget_without_page_reference_uses_owning_page_annotation() {
