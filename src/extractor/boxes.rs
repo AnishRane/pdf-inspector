@@ -16,6 +16,11 @@ use crate::types::{ItemType, PdfLine, PdfRect, TextItem, TextLine};
 /// bordered block of prose or a table, and keeps its lines.
 const MAX_BOX_HEIGHT: f32 = 60.0;
 const MAX_BOX_LINES: usize = 4;
+/// A name-and-address box (a payer, a fiduciary) runs taller: a label of a
+/// line or two over a value of up to five. Boxes this size merge only when
+/// their lines split cleanly into a label block over a value block.
+const MAX_TALL_BOX_HEIGHT: f32 = 110.0;
+const MAX_TALL_BOX_LINES: usize = 8;
 /// How far a rule's end may fall short of the point it should cover.
 const RULE_SLACK: f32 = 1.5;
 /// A filled rect this thin is a drawn rule. Wider rects are shading
@@ -50,10 +55,11 @@ pub(crate) fn merge_boxed_text(items: &mut Vec<TextItem>, rects: &[PdfRect], lin
     let mut merged: Vec<(usize, TextItem)> = Vec::new();
     let mut remove = vec![false; items.len()];
     for ((top, bottom, _), members) in boxes {
-        if members.len() < 2 || (top - bottom) as f32 / 2.0 > MAX_BOX_HEIGHT {
+        let height = (top - bottom) as f32 / 2.0;
+        if members.len() < 2 || height > MAX_TALL_BOX_HEIGHT {
             continue;
         }
-        let Some(item) = merge_box(items, &members) else {
+        let Some(item) = merge_box(items, &members, height) else {
             continue;
         };
         let first = *members.iter().min().expect("box has members");
@@ -82,8 +88,8 @@ pub(crate) fn merge_boxed_text(items: &mut Vec<TextItem>, rects: &[PdfRect], lin
 
 /// One item holding a box's text, line by line from the top, at its first
 /// line's baseline. `None` when the text sits on a single line (nothing to
-/// keep together) or on too many to be a form box.
-fn merge_box(items: &[TextItem], members: &[usize]) -> Option<TextItem> {
+/// keep together) or does not read as a form box's label and value.
+fn merge_box(items: &[TextItem], members: &[usize], height: f32) -> Option<TextItem> {
     let mut parts: Vec<&TextItem> = members.iter().map(|&index| &items[index]).collect();
     parts.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
     // Items share a line when their glyphs overlap vertically, so a raised
@@ -111,9 +117,10 @@ fn merge_box(items: &[TextItem], members: &[usize]) -> Option<TextItem> {
             box_lines.push(vec![part.clone()]);
         }
     }
-    if box_lines.len() < 2 || box_lines.len() > MAX_BOX_LINES {
+    if box_lines.len() < 2 || box_lines.len() > MAX_TALL_BOX_LINES {
         return None;
     }
+    let small = height <= MAX_BOX_HEIGHT && box_lines.len() <= MAX_BOX_LINES;
     // A field box opens with its printed label. A run of dot leaders on top
     // means the "box" is a band of form rows between section rules.
     let has_word = |line: &[TextItem]| {
@@ -130,9 +137,17 @@ fn merge_box(items: &[TextItem], members: &[usize]) -> Option<TextItem> {
         let main = main_run(line);
         (main.font.clone(), (main.font_size * 2.0).round() as i32)
     };
-    if box_lines
-        .iter()
-        .all(|line| face(line) == face(&box_lines[0]))
+    let faces: Vec<(String, i32)> = box_lines.iter().map(|line| face(line)).collect();
+    let value_start = faces.iter().position(|f| *f != faces[0])?;
+    // A taller box must read as a label block over a value block: each in
+    // one face, the label set no larger than the value. A bordered callout's
+    // heading is set larger than its body, and alternating faces are a list
+    // of questions and answers, not one field.
+    if !small
+        && (faces[value_start..]
+            .iter()
+            .any(|f| *f != faces[value_start])
+            || faces[0].1 > faces[value_start].1)
     {
         return None;
     }
@@ -588,6 +603,88 @@ mod tests {
         merge_boxed_text(&mut items, &[], &lines);
 
         assert_eq!(items.len(), 4);
+    }
+
+    /// A tall closed box (1099-DIV's payer box: 96pt high).
+    fn tall_box() -> Vec<PdfLine> {
+        vec![
+            line(49.9, 756.0, 295.6, 756.0),
+            line(49.9, 660.0, 295.6, 660.0),
+            line(50.4, 756.5, 50.4, 659.6),
+            line(295.6, 756.5, 295.6, 659.6),
+        ]
+    }
+
+    fn filled(value: &str, y: f32) -> TextItem {
+        let mut item = text(value, 54.4, y, 120.0, 8.0);
+        item.font = "HelveticaLTStd-Bold".to_string();
+        item
+    }
+
+    #[test]
+    fn tall_box_with_label_lines_over_value_lines_reads_together() {
+        // 1099-DIV: a two-line payer label over a four-line name and
+        // address. Split up, other boxes' text landed between its lines.
+        let mut items = vec![
+            text(
+                "PAYER'S name, street address, city or town, state or province,",
+                54.4,
+                747.0,
+                238.0,
+                7.0,
+            ),
+            text(
+                "country, ZIP or foreign postal code, and telephone no.",
+                54.4,
+                739.0,
+                200.0,
+                7.0,
+            ),
+            filled("Example Securities LLC", 728.3),
+            filled("1 Main Street, Suite 100", 718.8),
+            filled("New York, NY 10001", 709.3),
+            filled("(212) 555-0100", 699.7),
+        ];
+        merge_boxed_text(&mut items, &[], &tall_box());
+
+        assert_eq!(items.len(), 1);
+        assert!(items[0]
+            .text
+            .ends_with("telephone no. Example Securities LLC 1 Main Street, Suite 100 New York, NY 10001 (212) 555-0100"));
+    }
+
+    #[test]
+    fn tall_box_under_a_larger_heading_is_left_alone() {
+        // A bordered callout: a bold heading set larger than its body.
+        let mut heading = text("Important notice", 54.4, 740.0, 90.0, 12.0);
+        heading.font = "Helvetica-Bold".to_string();
+        let mut items = vec![heading];
+        for (row, y) in [725.0, 714.0, 703.0, 692.0, 681.0].into_iter().enumerate() {
+            items.push(text(
+                &format!("Body line {row} of the notice text"),
+                54.4,
+                y,
+                150.0,
+                9.0,
+            ));
+        }
+        merge_boxed_text(&mut items, &[], &tall_box());
+
+        assert_eq!(items.len(), 6);
+    }
+
+    #[test]
+    fn tall_box_with_alternating_faces_is_left_alone() {
+        let mut items = vec![
+            text("Question one", 54.4, 747.0, 60.0, 7.0),
+            filled("Answer one", 736.0),
+            text("Question two", 54.4, 725.0, 60.0, 7.0),
+            filled("Answer two", 714.0),
+            text("Question three", 54.4, 703.0, 60.0, 7.0),
+        ];
+        merge_boxed_text(&mut items, &[], &tall_box());
+
+        assert_eq!(items.len(), 5);
     }
 
     #[test]
