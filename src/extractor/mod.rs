@@ -423,6 +423,7 @@ fn extract_positioned_text_impl(
         if coords_rotated {
             items.extend(form_items);
         } else {
+            boxes::split_entry_parentheses(&mut items);
             boxes::join_comb_runs(&mut items, &rects, &lines);
             links::place_form_items(&mut items, form_items);
             checkboxes::attach_checkbox_labels(&mut items);

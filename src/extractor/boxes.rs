@@ -369,6 +369,47 @@ pub(crate) fn join_comb_runs(items: &mut Vec<TextItem>, rects: &[PdfRect], lines
     *items = joined;
 }
 
+/// Split a printed "(     )" entry area into its two parentheses.
+///
+/// Tax forms print the entry area for a loss as one run, an opening and a
+/// closing parenthesis with blank space between, and the filled amount sits
+/// in that space. As one item the run sorts ahead of the amount, and a
+/// loss read "( ) 799,199", like a gain. As two items placed at the run's
+/// ends, the amount reads inside them.
+pub(crate) fn split_entry_parentheses(items: &mut Vec<TextItem>) {
+    let is_entry_area = |text: &str| {
+        let text = text.trim();
+        text.len() >= 5
+            && text.starts_with('(')
+            && text.ends_with(')')
+            && text[1..text.len() - 1].chars().all(char::is_whitespace)
+    };
+    if !items.iter().any(|item| is_entry_area(&item.text)) {
+        return;
+    }
+    let mut split = Vec::with_capacity(items.len() + 1);
+    for item in items.drain(..) {
+        if !is_entry_area(&item.text) {
+            split.push(item);
+            continue;
+        }
+        // A parenthesis is about a third of an em wide.
+        let glyph = (item.font_size * 0.333).min(item.width / 2.0);
+        split.push(TextItem {
+            text: "(".to_string(),
+            width: glyph,
+            ..item.clone()
+        });
+        split.push(TextItem {
+            text: ")".to_string(),
+            x: item.x + item.width - glyph,
+            width: glyph,
+            ..item
+        });
+    }
+    *items = split;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +569,45 @@ mod tests {
         mixed[3].font = "Times-Roman".to_string();
         join_comb_runs(&mut mixed, &[], &ssn_box());
         assert_eq!(mixed.len(), 4);
+    }
+
+    #[test]
+    fn value_in_printed_parentheses_reads_inside_them() {
+        // Schedule E line 31 prints its entry area as one run "(   )":
+        // a loss filled in there must read inside the parentheses, not
+        // after them as if it were a gain.
+        let mut parens = text(
+            "(                                )",
+            490.4,
+            435.1,
+            84.8,
+            9.0,
+        );
+        parens.font = "T1_0".to_string();
+        let mut value = text("799,199", 541.1, 434.1, 28.9, 8.0);
+        value.font = "HelveticaLTStd-Bold".to_string();
+        let mut items = vec![parens, value];
+        split_entry_parentheses(&mut items);
+
+        let mut line_items = items.clone();
+        crate::text_utils::sort_line_items(&mut line_items);
+        let line = TextLine {
+            y: 435.1,
+            page: 1,
+            adaptive_threshold: 0.10,
+            items: line_items,
+        };
+        assert_eq!(line.text().replace(' ', ""), "(799,199)");
+    }
+
+    #[test]
+    fn ordinary_parenthesised_text_is_left_alone() {
+        let mut items = vec![
+            text("(see instructions)", 54.0, 500.0, 60.0, 7.0),
+            text("( )", 120.0, 500.0, 8.0, 7.0),
+        ];
+        split_entry_parentheses(&mut items);
+        assert_eq!(texts(&items), ["(see instructions)", "( )"]);
     }
 
     #[test]
