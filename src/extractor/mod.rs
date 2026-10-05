@@ -3184,6 +3184,62 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn value_column_may_carry_a_few_of_the_forms_labels() {
+        // Form 1065's amount strip also holds a few header entries ("PTIN",
+        // "Firm's EIN"): about three lines in four are figures.
+        let make_line = |text: &str, y: f32, x: f32, width: f32| TextLine {
+            y,
+            page: 1,
+            adaptive_threshold: 0.10,
+            items: vec![TextItem {
+                text: text.into(),
+                x,
+                y,
+                width,
+                height: 9.0,
+                font: "F1".into(),
+                font_size: 9.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+            }],
+        };
+        let rows: Vec<f32> = (0..40).map(|i| 700.0 - i as f32 * 12.0).collect();
+        let descriptions: Vec<TextLine> = rows
+            .iter()
+            .map(|&y| make_line("Taxes and licenses ....................", y, 50.0, 420.0))
+            .collect();
+        let values: Vec<TextLine> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, &y)| {
+                let text = if i % 4 == 3 {
+                    "Firm's EIN"
+                } else {
+                    "14 69,299"
+                };
+                make_line(text, y, 490.0, 80.0)
+            })
+            .collect();
+        let cols = vec![
+            ColumnRegion {
+                x_min: 40.0,
+                x_max: 480.0,
+            },
+            ColumnRegion {
+                x_min: 480.0,
+                x_max: 576.0,
+            },
+        ];
+
+        assert!(!is_newspaper_layout(&[descriptions, values], &cols));
+    }
+
     fn make_item_fs(text: &str, x: f32, y: f32, width: f32, font_size: f32) -> TextItem {
         TextItem {
             text: text.into(),
