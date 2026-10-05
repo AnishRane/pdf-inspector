@@ -225,6 +225,25 @@ impl Rules {
         }
     }
 
+    /// The nearest rules above and below an item's glyphs that span its
+    /// middle: the field row it sits in.
+    fn band(&self, item: &TextItem) -> Option<(f32, f32)> {
+        let size = item.font_size.max(1.0);
+        let (glyph_top, glyph_bottom) = (item.y + size * 0.7, item.y - size * 0.25);
+        let mid_x = item.x + item.width / 2.0;
+        let rows = || {
+            self.horizontal
+                .iter()
+                .filter(|&&(_, x0, x1)| x0 - RULE_SLACK <= mid_x && mid_x <= x1 + RULE_SLACK)
+                .map(|&(y, _, _)| y)
+        };
+        let top = rows().filter(|&y| y >= glyph_top - 0.5).reduce(f32::min)?;
+        let bottom = rows()
+            .filter(|&y| y <= glyph_bottom + 0.5)
+            .reduce(f32::max)?;
+        Some((top, bottom))
+    }
+
     /// The rules closing in an item: the nearest one above and below its
     /// glyphs and to its left and right, as `(top, bottom, left)` in
     /// half-points. The right wall must exist but is not part of the box's
@@ -232,18 +251,10 @@ impl Rules {
     /// between the label and the box's own right edge, but not beside the
     /// value.
     fn walls(&self, item: &TextItem) -> Option<(i32, i32, i32)> {
-        let size = item.font_size.max(1.0);
-        let (glyph_top, glyph_bottom) = (item.y + size * 0.7, item.y - size * 0.25);
-        let (mid_x, mid_y) = (item.x + item.width / 2.0, item.y + size * 0.3);
-        let spans_x =
-            |&&(_, x0, x1): &&(f32, f32, f32)| x0 - RULE_SLACK <= mid_x && mid_x <= x1 + RULE_SLACK;
+        let (top, bottom) = self.band(item)?;
+        let mid_y = item.y + item.font_size.max(1.0) * 0.3;
         let spans_y =
             |&&(_, y0, y1): &&(f32, f32, f32)| y0 - RULE_SLACK <= mid_y && mid_y <= y1 + RULE_SLACK;
-        let rows = || self.horizontal.iter().filter(spans_x).map(|&(y, _, _)| y);
-        let top = rows().filter(|&y| y >= glyph_top - 0.5).reduce(f32::min)?;
-        let bottom = rows()
-            .filter(|&y| y <= glyph_bottom + 0.5)
-            .reduce(f32::max)?;
         let left = self
             .vertical
             .iter()
@@ -260,6 +271,78 @@ impl Rules {
         let half_points = |v: f32| (v * 2.0).round() as i32;
         Some((half_points(top), half_points(bottom), half_points(left)))
     }
+}
+
+/// A comb's characters sit at most this many ems apart; a calendar's or a
+/// rating scale's cells are wider.
+const MAX_COMB_PITCH_EM: f32 = 2.2;
+const MIN_COMB_CHARS: usize = 4;
+
+/// Join the characters a flattened comb field draws one per box.
+///
+/// A comb field (an SSN, an EIN, a date) spreads its value over a row of
+/// boxes, one character each. Flattened, each character is a run of its
+/// own, and the value read "1 2 3 4 5 6 7 8 9", a shape that SSN and
+/// account patterns miss. Consecutive single characters (letters, digits or
+/// `-`) on one baseline, in one face, at one pitch visibly wider than a
+/// glyph and at most [`MAX_COMB_PITCH_EM`], all inside one small ruled box,
+/// are joined into one value; four or more make a comb.
+pub(crate) fn join_comb_runs(items: &mut Vec<TextItem>, rects: &[PdfRect], lines: &[PdfLine]) {
+    let rules = Rules::new(rects, lines);
+    // Every character of a comb sits between the same rules above and below:
+    // one field row. (The row's last box may be closed only by the form's
+    // frame.)
+    let in_one_box = |run: &[TextItem]| {
+        let bands: Vec<Option<(f32, f32)>> = run.iter().map(|item| rules.band(item)).collect();
+        bands[0].is_some_and(|(top, bottom)| top - bottom <= MAX_BOX_HEIGHT)
+            && bands.iter().all(|band| *band == bands[0])
+    };
+    let is_comb_char = |item: &TextItem| {
+        let mut chars = item.text.trim().chars();
+        matches!(item.item_type, ItemType::Text)
+            && matches!((chars.next(), chars.next()), (Some(c), None) if c.is_ascii_alphanumeric() || c == '-')
+    };
+    let mut joined = Vec::with_capacity(items.len());
+    let mut start = 0;
+    while start < items.len() {
+        let first = &items[start];
+        let mut end = start + 1;
+        if is_comb_char(first) {
+            let size = first.font_size.max(1.0);
+            let pitch = items
+                .get(start + 1)
+                .map(|next| next.x - first.x)
+                .unwrap_or(0.0);
+            let spaced = pitch >= first.width + 0.25 * size && pitch <= MAX_COMB_PITCH_EM * size;
+            while spaced && end < items.len() {
+                let (prev, next) = (&items[end - 1], &items[end]);
+                let same_run = is_comb_char(next)
+                    && next.page == first.page
+                    && next.font == first.font
+                    && (next.font_size - first.font_size).abs() < 0.01
+                    && (next.y - first.y).abs() <= 0.5
+                    && ((next.x - prev.x) - pitch).abs() <= (0.03 * pitch).max(0.3);
+                if !same_run {
+                    break;
+                }
+                end += 1;
+            }
+        }
+        if end - start >= MIN_COMB_CHARS && in_one_box(&items[start..end]) {
+            let run = &items[start..end];
+            let last = &run[run.len() - 1];
+            joined.push(TextItem {
+                text: run.iter().map(|item| item.text.trim()).collect(),
+                width: last.x + last.width - first.x,
+                ..first.clone()
+            });
+            start = end;
+        } else {
+            joined.push(items[start].clone());
+            start += 1;
+        }
+    }
+    *items = joined;
 }
 
 #[cfg(test)]
@@ -332,6 +415,95 @@ mod tests {
 
     fn texts(items: &[TextItem]) -> Vec<&str> {
         items.iter().map(|item| item.text.as_str()).collect()
+    }
+
+    /// Single characters as a flattened comb field draws them: one per
+    /// box, on one baseline, at one pitch.
+    fn comb(chars: &str, x: f32, pitch: f32, font_size: f32) -> Vec<TextItem> {
+        chars
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut item = text(
+                    &c.to_string(),
+                    x + i as f32 * pitch,
+                    687.15,
+                    4.45,
+                    font_size,
+                );
+                item.font = "HelveticaLTStd-Bold".to_string();
+                item
+            })
+            .collect()
+    }
+
+    /// The 1040 SSN box, x 468–576 and y 684–708, with ticks marking the
+    /// 3-2-4 groups.
+    fn ssn_box() -> Vec<PdfLine> {
+        vec![
+            line(467.8, 708.0, 576.2, 708.0),
+            line(467.8, 684.0, 576.2, 684.0),
+            line(468.0, 708.4, 468.0, 683.8),
+            line(576.0, 708.4, 576.0, 683.8),
+            line(500.7, 694.0, 500.7, 684.0),
+            line(522.4, 694.0, 522.4, 684.0),
+        ]
+    }
+
+    #[test]
+    fn comb_digits_join_into_one_value() {
+        // The 1040 SSN box: nine digits at an 11.89pt pitch, 8pt type.
+        let mut items = vec![text("Your social security number", 472.0, 700.0, 95.5, 7.0)];
+        items.extend(comb("123456789", 472.72, 11.89, 8.0));
+        join_comb_runs(&mut items, &[], &ssn_box());
+
+        assert_eq!(texts(&items), ["Your social security number", "123456789"]);
+        assert_eq!(items[1].x, 472.72);
+        assert!((items[1].x + items[1].width - (472.72 + 8.0 * 11.89 + 4.45)).abs() < 0.01);
+    }
+
+    #[test]
+    fn comb_keeps_dashes_it_draws() {
+        let mut items = comb("12-3456", 472.72, 11.0, 8.0);
+        join_comb_runs(&mut items, &[], &ssn_box());
+        assert_eq!(texts(&items), ["12-3456"]);
+    }
+
+    #[test]
+    fn spaced_characters_outside_a_box_are_not_a_comb() {
+        // A chart's axis labels broken into single characters at a regular
+        // pitch, with no field box around them.
+        let mut items = comb("999999", 472.72, 11.89, 8.0);
+        join_comb_runs(&mut items, &[], &[]);
+        assert_eq!(items.len(), 6);
+    }
+
+    #[test]
+    fn wide_spaced_digits_are_not_a_comb() {
+        // A calendar's first week: cells far wider than a comb box.
+        let mut items = comb("1234567", 100.0, 30.0, 10.0);
+        join_comb_runs(&mut items, &[], &ssn_box());
+        assert_eq!(items.len(), 7);
+    }
+
+    #[test]
+    fn irregular_pitch_is_not_a_comb() {
+        let mut items = comb("1234", 472.72, 11.0, 8.0);
+        items[2].x += 4.0;
+        join_comb_runs(&mut items, &[], &ssn_box());
+        assert_eq!(items.len(), 4);
+    }
+
+    #[test]
+    fn short_runs_and_mixed_faces_are_not_combs() {
+        let mut short = comb("123", 472.72, 11.0, 8.0);
+        join_comb_runs(&mut short, &[], &ssn_box());
+        assert_eq!(short.len(), 3);
+
+        let mut mixed = comb("1234", 472.72, 11.0, 8.0);
+        mixed[3].font = "Times-Roman".to_string();
+        join_comb_runs(&mut mixed, &[], &ssn_box());
+        assert_eq!(mixed.len(), 4);
     }
 
     #[test]
