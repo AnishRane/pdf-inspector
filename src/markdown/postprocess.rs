@@ -83,7 +83,8 @@ fn collapse_consecutive_spaces(text: &mut String) {
 fn remove_spaces_before_closing_brackets(text: &mut String) {
     let mut result = String::with_capacity(text.len());
     for ch in text.chars() {
-        if ch == ']' && result.ends_with(' ') {
+        // "[ ]" is an unticked checkbox, not an empty bracket pair.
+        if ch == ']' && result.ends_with(' ') && !result.ends_with("[ ") {
             result.pop();
         }
         result.push(ch);
@@ -352,6 +353,13 @@ mod tests {
             input,
             "Density [kg/m3] and [linked text](https://example.com)"
         );
+    }
+
+    #[test]
+    fn unticked_checkbox_keeps_its_space() {
+        let mut input = "[ ] Head of household [x] Single".to_string();
+        remove_spaces_before_closing_brackets(&mut input);
+        assert_eq!(input, "[ ] Head of household [x] Single");
     }
 
     // --- remove_spaces_before_sentence_punctuation ---

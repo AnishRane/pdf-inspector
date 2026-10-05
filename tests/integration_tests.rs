@@ -4399,3 +4399,270 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
         page.markdown
     );
 }
+
+/// A one-page fillable form laid out like the top of an IRS 1040: labels
+/// printed above or beside AcroForm widgets that carry the filled values.
+fn synthetic_fillable_form_pdf() -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream, StringFormat};
+
+    fn utf16be(s: &str) -> Object {
+        let mut bytes = vec![0xFE, 0xFF];
+        for unit in s.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        Object::String(bytes, StringFormat::Literal)
+    }
+
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut operations = vec![Operation::new("BT", vec![])];
+    let mut show = |x: f32, y: f32, size: f32, text: &str| {
+        operations.push(Operation::new("Tf", vec!["F1".into(), size.into()]));
+        operations.push(Operation::new(
+            "Tm",
+            vec![1.into(), 0.into(), 0.into(), 1.into(), x.into(), y.into()],
+        ));
+        operations.push(Operation::new("Tj", vec![Object::string_literal(text)]));
+    };
+    show(
+        36.0,
+        740.0,
+        14.0,
+        "Form 1040 U.S. Individual Income Tax Return 2025",
+    );
+    show(36.0, 700.0, 7.0, "Your first name and middle initial");
+    show(256.0, 700.0, 7.0, "Last name");
+    show(472.0, 700.0, 7.0, "Your social security number");
+    show(
+        36.0,
+        652.0,
+        7.0,
+        "Home address (number and street). If you have a P.O. box, see instructions.",
+    );
+    show(
+        36.0,
+        628.0,
+        7.0,
+        "City, town, or post office. If you have a foreign address, see instructions.",
+    );
+    show(36.0, 577.0, 10.0, "Filing Status");
+    show(110.0, 578.3, 8.0, "Single");
+    show(362.0, 578.3, 8.0, "Head of household (HOH)");
+    show(
+        36.0,
+        540.0,
+        8.0,
+        "Check only one box. Enter the child's name if the qualifying person is a child.",
+    );
+    show(
+        108.0,
+        332.0,
+        8.0,
+        "Total amount from Form(s) W-2, box 1 (see instructions)",
+    );
+    show(489.0, 332.0, 8.0, "1a");
+    show(
+        108.0,
+        320.0,
+        8.0,
+        "Household employee wages not reported on Form(s) W-2",
+    );
+    show(489.0, 320.0, 8.0, "1b");
+    // Instruction text down the rest of the page, in reading order, so the
+    // content stream reads top to bottom as a real form's does.
+    for (i, y) in [290.0, 236.0, 182.0, 128.0, 74.0].into_iter().enumerate() {
+        show(
+            36.0,
+            y,
+            8.0,
+            &format!("Instruction {i} explains how to complete the lines above."),
+        );
+    }
+    show(
+        36.0,
+        40.0,
+        7.0,
+        "For Disclosure, Privacy Act, and Paperwork Reduction Act Notice, see instructions.",
+    );
+    operations.push(Operation::new("ET", vec![]));
+    let content = Content { operations }.encode().unwrap();
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+
+    let rect = |x1: f32, y1: f32, x2: f32, y2: f32| -> Object {
+        vec![x1.into(), y1.into(), x2.into(), y2.into()].into()
+    };
+    let widget = |name: &str, ft: &str, rect: Object| {
+        dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Widget",
+            "FT" => ft,
+            "T" => utf16be(name),
+            "Rect" => rect,
+            "P" => page_id,
+        }
+    };
+    let mut fields = Vec::new();
+    let mut text_field =
+        |doc: &mut Document, name: &str, value: &str, r: Object, extra: &[(&str, Object)]| {
+            let mut dict = widget(name, "Tx", r);
+            dict.set("V", utf16be(value));
+            for (key, val) in extra {
+                dict.set(*key, val.clone());
+            }
+            let id = doc.add_object(dict);
+            fields.push(id);
+        };
+    text_field(
+        &mut doc,
+        "topmostSubform[0].Page1[0].f1_14[0]",
+        "Celeste W",
+        rect(36.0, 684.0, 251.0, 698.0),
+        &[],
+    );
+    text_field(
+        &mut doc,
+        "topmostSubform[0].Page1[0].f1_15[0]",
+        "Halvorsen-Pryce",
+        rect(253.0, 684.0, 467.0, 698.0),
+        &[],
+    );
+    text_field(
+        &mut doc,
+        "topmostSubform[0].Page1[0].f1_16[0]",
+        "987-65-4324",
+        rect(469.0, 684.0, 576.0, 698.0),
+        &[
+            ("Ff", Object::Integer(1 << 24)),
+            ("MaxLen", Object::Integer(11)),
+        ],
+    );
+    text_field(
+        &mut doc,
+        "topmostSubform[0].Page1[0].f1_20[0]",
+        "955 Marchbank Road",
+        rect(36.0, 636.0, 417.0, 650.0),
+        &[],
+    );
+    text_field(
+        &mut doc,
+        "topmostSubform[0].Page1[0].f1_47[0]",
+        "584000",
+        rect(504.0, 330.0, 576.0, 342.0),
+        &[],
+    );
+    text_field(
+        &mut doc,
+        "topmostSubform[0].Page1[0].f1_48[0]",
+        "",
+        rect(504.0, 318.0, 576.0, 330.0),
+        &[],
+    );
+    text_field(
+        &mut doc,
+        "topmostSubform[0].Page1[0].f1_90[0]",
+        "Read-only mirror",
+        rect(36.0, 205.0, 300.0, 219.0),
+        &[("Ff", Object::Integer(1))],
+    );
+    text_field(
+        &mut doc,
+        "topmostSubform[0].Page1[0].f1_91[0]",
+        "Hidden value",
+        rect(36.0, 150.0, 300.0, 164.0),
+        &[("F", Object::Integer(2))],
+    );
+    for (name, state, x) in [("c1_8[0]", "1", 98.0), ("c1_8[1]", "Off", 350.0)] {
+        let mut dict = widget(
+            &format!("topmostSubform[0].Page1[0].{name}"),
+            "Btn",
+            rect(x, 578.0, x + 8.0, 586.0),
+        );
+        dict.set("V", Object::Name(state.as_bytes().to_vec()));
+        dict.set("AS", Object::Name(state.as_bytes().to_vec()));
+        fields.push(doc.add_object(dict));
+    }
+
+    doc.objects.insert(
+        page_id,
+        dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            "Contents" => content_id,
+            "Annots" => fields.iter().map(|&id| Object::Reference(id)).collect::<Vec<_>>(),
+        }
+        .into(),
+    );
+    doc.objects.insert(
+        pages_id,
+        dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 }.into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "AcroForm" => dictionary! {
+            "Fields" => fields.iter().map(|&id| Object::Reference(id)).collect::<Vec<_>>(),
+        },
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn fillable_form_values_sit_beside_their_labels() {
+    let markdown = process_pdf_mem(&synthetic_fillable_form_pdf())
+        .expect("convert fillable form")
+        .markdown
+        .expect("markdown output");
+    let lines: Vec<&str> = markdown.lines().collect();
+    let line_of = |needle: &str| {
+        lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing from:\n{markdown}"))
+    };
+    // The value's own line or one of the two above it carries its label.
+    let assert_labelled = |value: &str, label: &str| {
+        let at = line_of(value);
+        let window = lines[at.saturating_sub(2)..=at].join("\n");
+        assert!(
+            window.contains(label),
+            "{value:?} is not beside {label:?}:\n{markdown}"
+        );
+    };
+
+    assert_labelled("Celeste W", "first name");
+    assert_labelled("Halvorsen-Pryce", "Last name");
+    assert_labelled("987-65-4324", "social security number");
+    assert_labelled("955 Marchbank Road", "Home address");
+    // Values read in place, ahead of the text printed below them.
+    let offset = |needle: &str| markdown.find(needle).unwrap_or(usize::MAX);
+    assert!(offset("Celeste W") < offset("City, town"), "{markdown}");
+    assert!(line_of("584000") == line_of("1a"), "{markdown}");
+    assert!(markdown.contains("[x] Single"), "{markdown}");
+    assert!(markdown.contains("[ ] Head of household"), "{markdown}");
+
+    for absent in [
+        "topmostSubform",
+        "f1_14",
+        "Read-only mirror",
+        "Hidden value",
+    ] {
+        assert!(
+            !markdown.contains(absent),
+            "{absent:?} leaked into:\n{markdown}"
+        );
+    }
+}

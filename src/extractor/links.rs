@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::fonts::{resolve_array, resolve_dict};
 use super::get_number;
+use log::debug;
 
 /// Upper bound on the number of form-field nodes visited during a single
 /// `extract_form_fields` pass. A crafted PDF can chain thousands of distinct
@@ -160,7 +161,14 @@ pub(crate) fn extract_link_uri(doc: &Document, annot_dict: &lopdf::Dictionary) -
 }
 
 /// Extract form field values from AcroForm dictionary.
-/// Returns TextItems positioned at each field's Rect so they flow into the markdown pipeline.
+///
+/// Each visible widget yields its value laid out inside the widget's
+/// `/Rect`, as a viewer would draw it: a text field's value (one item per
+/// line), or `[x]` / `[ ]` for a checkbox or radio button. Empty, read-only,
+/// hidden, password, push-button and signature fields yield nothing. Field
+/// names such as `topmostSubform[0].Page1[0].f1_14[0]` are internal plumbing
+/// and never reach the text; `RUST_LOG=pdf_inspector::extractor::links=debug`
+/// logs each one beside its value.
 pub(crate) fn extract_form_fields(
     doc: &Document,
     page_map: &HashMap<ObjectId, u32>,
@@ -219,7 +227,7 @@ pub(crate) fn extract_form_fields(
             walk_form_fields(
                 doc,
                 field_ref,
-                None,
+                Inherited::default(),
                 "",
                 page_map,
                 &annotation_pages,
@@ -232,6 +240,23 @@ pub(crate) fn extract_form_fields(
 
     items
 }
+
+/// Field attributes a widget inherits from its ancestor fields
+/// (ISO 32000-1 12.7.3.1): field type, field flags and value.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Inherited<'a> {
+    ft: Option<&'a [u8]>,
+    flags: i64,
+    value: Option<&'a Object>,
+}
+
+// Field flags (`/Ff`, ISO 32000-1 tables 221, 226 and 228).
+const FF_READ_ONLY: i64 = 1;
+const FF_MULTILINE: i64 = 1 << 12;
+const FF_PASSWORD: i64 = 1 << 13;
+const FF_PUSHBUTTON: i64 = 1 << 16;
+// Annotation flags (`/F`, ISO 32000-1 table 165): Hidden and NoView.
+const F_NOT_SHOWN: i64 = (1 << 1) | (1 << 5);
 
 /// Map widget annotation objects back to the page whose `/Annots` array owns
 /// them. Some valid widgets omit `/P`, so the page tree is the only reliable
@@ -261,10 +286,10 @@ fn annotation_page_map(
 
 /// Recursively walk the form field tree, extracting leaf field values.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn walk_form_fields(
-    doc: &Document,
+pub(crate) fn walk_form_fields<'a>(
+    doc: &'a Document,
     field_id: ObjectId,
-    parent_ft: Option<&[u8]>,
+    inherited: Inherited<'a>,
     parent_name: &str,
     page_map: &HashMap<ObjectId, u32>,
     annotation_pages: &HashMap<ObjectId, u32>,
@@ -290,28 +315,30 @@ pub(crate) fn walk_form_fields(
         Err(_) => return,
     };
 
-    // Build fully qualified field name
-    let local_name = field_dict
-        .get(b"T")
-        .ok()
-        .and_then(|o| o.as_str().ok())
-        .map(decode_text_string)
-        .unwrap_or_default();
+    let full_name = qualified_field_name(field_dict, parent_name);
 
-    let full_name = if parent_name.is_empty() {
-        local_name.clone()
-    } else if local_name.is_empty() {
-        parent_name.to_string()
-    } else {
-        format!("{}.{}", parent_name, local_name)
+    // Type, flags and value may each be inherited from a parent.
+    let integer = |key: &[u8]| {
+        field_dict
+            .get(key)
+            .ok()
+            .and_then(|o| doc.dereference(o).ok())
+            .and_then(|(_, o)| o.as_i64().ok())
     };
-
-    // Determine field type (may be inherited from parent)
-    let ft = field_dict
-        .get(b"FT")
-        .ok()
-        .and_then(|o| o.as_name().ok())
-        .or(parent_ft);
+    let inherited = Inherited {
+        ft: field_dict
+            .get(b"FT")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .or(inherited.ft),
+        flags: integer(b"Ff").unwrap_or(inherited.flags),
+        value: field_dict
+            .get(b"V")
+            .ok()
+            .and_then(|o| doc.dereference(o).ok())
+            .map(|(_, o)| o)
+            .or(inherited.value),
+    };
 
     // Check for /Kids — if present, recurse into children
     if let Ok(kids_obj) = field_dict.get(b"Kids") {
@@ -332,7 +359,7 @@ pub(crate) fn walk_form_fields(
                     walk_form_fields(
                         doc,
                         kid_ref,
-                        ft,
+                        inherited,
                         &full_name,
                         page_map,
                         annotation_pages,
@@ -346,70 +373,73 @@ pub(crate) fn walk_form_fields(
         }
     }
 
-    // Leaf field — extract value
-    let ft = match ft {
-        Some(ft) => ft,
-        None => return,
+    // Leaf: a widget (or a field merged with its widget).
+    let Some(ft) = inherited.ft else {
+        return;
     };
-
-    // Skip signature fields
-    if ft == b"Sig" {
+    let flags = inherited.flags;
+    let annotation_flags = integer(b"F").unwrap_or(0);
+    if flags & FF_READ_ONLY != 0 || annotation_flags & F_NOT_SHOWN != 0 {
         return;
     }
 
-    // Get field value
-    let value = match field_dict.get(b"V") {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let value_str = match ft {
+    let text: String = match ft {
         b"Tx" | b"Ch" => {
-            // Text or Choice field — value is a string or array of strings
-            match value {
-                Object::String(s, _) => {
-                    let s = decode_text_string(s);
-                    if s.is_empty() {
-                        return;
-                    }
-                    s
-                }
-                Object::Array(arr) => {
-                    let parts: Vec<String> = arr
-                        .iter()
-                        .filter_map(|o| {
-                            if let Object::String(s, _) = o {
-                                Some(decode_text_string(s))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if parts.is_empty() {
-                        return;
-                    }
-                    parts.join(", ")
-                }
-                _ => return,
+            if ft == b"Tx" && flags & FF_PASSWORD != 0 {
+                return;
             }
+            // A text value, or a choice field's selected option(s).
+            let value = match inherited.value {
+                Some(Object::String(s, _)) => decode_text_string(s),
+                Some(Object::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|o| match o {
+                        Object::String(s, _) => Some(decode_text_string(s)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => return,
+            };
+            // One item per field: a multiline value (a payer's name and
+            // address) reads as one run, its lines joined by commas, so no
+            // neighbouring column's text can land between them.
+            let mut joined = String::new();
+            for line in value.split(['\r', '\n']).map(str::trim) {
+                if line.is_empty() {
+                    continue;
+                }
+                if !joined.is_empty() {
+                    joined.push_str(if joined.ends_with([',', ';']) {
+                        " "
+                    } else {
+                        ", "
+                    });
+                }
+                joined.push_str(line);
+            }
+            joined
         }
         b"Btn" => {
-            // Checkbox/radio — value is a name
-            match value.as_name() {
-                Ok(name) if name == b"Off" => return,
-                Ok(name) => {
-                    let name_str = String::from_utf8_lossy(name).to_string();
-                    if name_str == "Yes" || name_str == "1" {
-                        "Yes".to_string()
-                    } else {
-                        name_str
-                    }
-                }
-                Err(_) => return,
+            if flags & FF_PUSHBUTTON != 0 {
+                return;
             }
+            // The widget's appearance state says whether this box shows its
+            // check; a radio group's kids share one value, so only `/AS`
+            // tells them apart.
+            let state = field_dict
+                .get(b"AS")
+                .ok()
+                .or(inherited.value)
+                .and_then(|o| o.as_name().ok());
+            let checked = state.is_some_and(|name| name != b"Off");
+            if checked { "[x]" } else { "[ ]" }.to_string()
         }
         _ => return,
     };
+    if text.is_empty() {
+        return;
+    }
 
     // Get Rect for positioning
     let (x, y, width, height) = match field_dict.get(b"Rect") {
@@ -419,7 +449,7 @@ pub(crate) fn walk_form_fields(
                 let y1 = get_number(&rect_array[1]).unwrap_or(0.0);
                 let x2 = get_number(&rect_array[2]).unwrap_or(0.0);
                 let y2 = get_number(&rect_array[3]).unwrap_or(0.0);
-                (x1, y1.min(y2), (x2 - x1).abs(), (y2 - y1).abs())
+                (x1.min(x2), y1.min(y2), (x2 - x1).abs(), (y2 - y1).abs())
             }
             _ => (0.0, 0.0, 0.0, 0.0),
         },
@@ -435,20 +465,34 @@ pub(crate) fn walk_form_fields(
         .or_else(|| annotation_pages.get(&field_id).copied())
         .unwrap_or(1);
 
-    let text = if full_name.is_empty() {
-        value_str
-    } else {
-        format!("{}: {}", full_name, value_str)
-    };
+    debug!(
+        "form field {:?} = {:?} on page {} at ({:.1}, {:.1}, {:.1}x{:.1})",
+        full_name, text, page_num, x, y, width, height
+    );
 
+    // The value spans its widget box, which is where the form shows it and
+    // what table cells and columns should see; its baseline sits where a
+    // viewer draws it: a single line centred vertically, multiline text from
+    // the top. A comb field's characters spread over the box all the same.
+    let multiline = flags & FF_MULTILINE != 0;
+    let size = if multiline {
+        8.0
+    } else {
+        (height * 0.6).clamp(6.0, 10.0)
+    };
+    let baseline = if multiline {
+        y + height - 2.0 - size * 0.8
+    } else {
+        y + ((height - size) / 2.0).max(0.0) + size * 0.25
+    };
     items.push(TextItem {
         text,
         x,
-        y,
+        y: baseline,
         width,
         height,
         font: String::new(),
-        font_size: 0.0,
+        font_size: size,
         page: page_num,
         is_bold: false,
         is_italic: false,
@@ -457,6 +501,181 @@ pub(crate) fn walk_form_fields(
         item_type: ItemType::FormField,
         mcid: None,
     });
+}
+
+/// The field's fully qualified name: its ancestors' partial names and its
+/// own `/T`, joined by periods (ISO 32000-1 12.7.3.2). `/T` is a text
+/// string, often UTF-16BE on IRS forms.
+fn qualified_field_name(field_dict: &lopdf::Dictionary, parent_name: &str) -> String {
+    let local_name = field_dict
+        .get(b"T")
+        .ok()
+        .and_then(|o| o.as_str().ok())
+        .map(decode_text_string)
+        .unwrap_or_default();
+    if parent_name.is_empty() {
+        local_name
+    } else if local_name.is_empty() {
+        parent_name.to_string()
+    } else {
+        format!("{}.{}", parent_name, local_name)
+    }
+}
+
+/// Baselines this close share a row.
+const ROW_TOLERANCE: f32 = 3.0;
+
+/// Where a form value joins the page's content stream: just before or just
+/// after the printed item at `index` on its row (snapped to its baseline),
+/// just after the label printed above its box, or just after the nearest
+/// text when no label is in reach.
+enum Anchor {
+    Before(usize, f32),
+    After(usize, f32),
+    Under(usize),
+    Near(usize),
+}
+
+/// Splice one page's form-field values into its content-stream order, each
+/// beside the printed text it belongs with.
+///
+/// Widget values are not part of the page's content stream, so appended to
+/// it they were read after the whole page, far from their labels. Placed
+/// here they read as the form would flattened: a value after the label to
+/// its left on the same row ("1a 584000"), else after the label printed
+/// above its box ("Last name" / "Halvorsen-Pryce"); a checkbox before the
+/// option label to its right ("[x] Single"). A value takes the text size
+/// of the label it is read with, so it never outranks that label and reads
+/// as a heading.
+pub(crate) fn place_form_items(items: &mut Vec<TextItem>, fields: Vec<TextItem>) {
+    if fields.is_empty() {
+        return;
+    }
+    let body_size = body_font_size(items);
+    let mut before: HashMap<usize, Vec<TextItem>> = HashMap::new();
+    let mut after: HashMap<usize, Vec<TextItem>> = HashMap::new();
+    let mut unplaced = Vec::new();
+    for mut field in fields {
+        field.font_size = body_size;
+        let Some(placement) = anchor(items, &field) else {
+            unplaced.push(field);
+            continue;
+        };
+        let (index, row_y, under) = match placement {
+            Anchor::Before(index, y) | Anchor::After(index, y) => (index, Some(y), false),
+            Anchor::Under(index) => (index, None, true),
+            Anchor::Near(index) => (index, None, false),
+        };
+        let label = &items[index];
+        field.y = row_y.unwrap_or(field.y);
+        if label.font_size > 0.0 {
+            field.font_size = label.font_size;
+        }
+        // The value covers its text, not the whole widget box, so a wide box
+        // does not straddle the page's columns. Under a label it covers at
+        // least the label too, sharing the label's column and table cell.
+        if !crate::text_utils::is_checkbox_token(&field.text) {
+            let text_width = field.text.chars().count() as f32 * field.font_size * 0.5;
+            let floor = if under { label.width } else { 0.0 };
+            field.width = text_width.max(floor).min(field.width);
+        }
+        let group = if matches!(placement, Anchor::Before(..)) {
+            &mut before
+        } else {
+            &mut after
+        };
+        group.entry(index).or_default().push(field);
+    }
+    // Several values at one anchor read top to bottom, left to right.
+    let reading_order = |a: &TextItem, b: &TextItem| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x));
+    let mut placed = Vec::with_capacity(items.len() + unplaced.len());
+    for (index, item) in std::mem::take(items).into_iter().enumerate() {
+        if let Some(mut group) = before.remove(&index) {
+            group.sort_by(reading_order);
+            placed.extend(group);
+        }
+        placed.push(item);
+        if let Some(mut group) = after.remove(&index) {
+            group.sort_by(reading_order);
+            placed.extend(group);
+        }
+    }
+    unplaced.sort_by(reading_order);
+    placed.extend(unplaced);
+    *items = placed;
+}
+
+/// The most common text size on the page.
+fn body_font_size(items: &[TextItem]) -> f32 {
+    let mut counts: HashMap<u32, usize> = HashMap::new();
+    for item in items.iter().filter(|item| is_printed_text(item)) {
+        *counts
+            .entry((item.font_size * 2.0).round() as u32)
+            .or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|&(size, count)| (count, size))
+        .map(|(size, _)| size as f32 / 2.0)
+        .filter(|&size| size > 0.0)
+        .unwrap_or(10.0)
+}
+
+/// Printed words a value can be read beside.
+fn is_printed_text(item: &TextItem) -> bool {
+    matches!(item.item_type, ItemType::Text) && item.text.chars().any(char::is_alphanumeric)
+}
+
+fn anchor(items: &[TextItem], field: &TextItem) -> Option<Anchor> {
+    let right_edge = |item: &TextItem| item.x + item.width;
+    let candidates = || {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| is_printed_text(item))
+    };
+    let same_row = |item: &TextItem| (item.y - field.y).abs() <= ROW_TOLERANCE;
+    let left = candidates()
+        .filter(|(_, item)| same_row(item) && right_edge(item) <= field.x + 2.0)
+        .max_by(|(_, a), (_, b)| right_edge(a).total_cmp(&right_edge(b)));
+    let right = candidates()
+        .filter(|(_, item)| same_row(item) && item.x >= right_edge(field) - 2.0)
+        .min_by(|(_, a), (_, b)| a.x.total_cmp(&b.x));
+
+    // A checkbox's label is the option word just right of the box.
+    if crate::text_utils::is_checkbox_token(&field.text) {
+        let reach = (field.font_size * 2.0).max(12.0);
+        if let Some((index, label)) = right.filter(|(_, r)| r.x - right_edge(field) <= reach) {
+            return Some(Anchor::Before(index, label.y));
+        }
+    }
+    if let Some((index, label)) = left {
+        return Some(Anchor::After(index, label.y));
+    }
+    // The label printed above the box: the nearest text overlapping it.
+    let reach_above = field.height + 3.0 * field.font_size;
+    let above = candidates()
+        .filter(|(_, item)| {
+            item.y > field.y + ROW_TOLERANCE
+                && item.y - field.y <= reach_above
+                && item.x < right_edge(field)
+                && right_edge(item) > field.x
+        })
+        .min_by(|(_, a), (_, b)| {
+            a.y.total_cmp(&b.y)
+                .then((a.x - field.x).abs().total_cmp(&(b.x - field.x).abs()))
+        });
+    if let Some((index, _)) = above {
+        return Some(Anchor::Under(index));
+    }
+    if let Some((index, label)) = right {
+        return Some(Anchor::Before(index, label.y));
+    }
+    // No label in reach: read it after the nearest text.
+    let distance = |item: &TextItem| (item.x - field.x).powi(2) + (item.y - field.y).powi(2);
+    candidates()
+        .min_by(|(_, a), (_, b)| distance(a).total_cmp(&distance(b)))
+        .map(|(index, _)| Anchor::Near(index))
 }
 
 #[cfg(test)]
@@ -503,6 +722,18 @@ mod tests {
         // Real IRS forms store `/T` as UTF-16BE. Decoding those bytes as UTF-8
         // interleaves a NUL between every ASCII character and turns the BOM
         // into U+FFFD, which is what leaked into extracted Markdown.
+        let field = dictionary! {
+            "T" => Object::String(utf16be("f1_14[0]"), StringFormat::Literal),
+        };
+
+        assert_eq!(
+            qualified_field_name(&field, "topmostSubform[0].Page1[0]"),
+            "topmostSubform[0].Page1[0].f1_14[0]"
+        );
+    }
+
+    #[test]
+    fn field_name_never_reaches_the_value_text() {
         let (doc, page_map) = single_field_doc(
             Object::String(
                 utf16be("topmostSubform[0].Page1[0].f1_14[0]"),
@@ -514,7 +745,7 @@ mod tests {
         let items = extract_form_fields(&doc, &page_map);
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].text, "topmostSubform[0].Page1[0].f1_14[0]: Alice");
+        assert_eq!(items[0].text, "Alice");
     }
 
     #[test]
@@ -527,7 +758,7 @@ mod tests {
         let items = extract_form_fields(&doc, &page_map);
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].text, "customer: Zoë Ruiz");
+        assert_eq!(items[0].text, "Zoë Ruiz");
     }
 
     #[test]
@@ -580,7 +811,7 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].page, 2);
-        assert_eq!(items[0].text, "customer: Alice");
+        assert_eq!(items[0].text, "Alice");
     }
 
     #[test]
@@ -802,5 +1033,366 @@ mod tests {
         let page_map = HashMap::new();
         let items = extract_form_fields(&doc, &page_map);
         assert_eq!(items.len(), 1);
+    }
+
+    /// One page holding the given widget dictionaries as AcroForm fields.
+    fn form_doc(widgets: Vec<lopdf::Dictionary>) -> (Document, HashMap<ObjectId, u32>) {
+        let mut doc = Document::new();
+        let ids: Vec<ObjectId> = widgets.into_iter().map(|w| doc.add_object(w)).collect();
+        let refs: Vec<Object> = ids.iter().map(|&id| Object::Reference(id)).collect();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Annots" => refs.clone(),
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! { "Fields" => refs },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, HashMap::from([(page_id, 1)]))
+    }
+
+    fn texts(items: &[TextItem]) -> Vec<&str> {
+        items.iter().map(|item| item.text.as_str()).collect()
+    }
+
+    #[test]
+    fn read_only_hidden_password_and_empty_fields_emit_nothing() {
+        let tx = |name: &str, value: &str| {
+            dictionary! {
+                "FT" => "Tx",
+                "T" => Object::string_literal(name),
+                "V" => Object::string_literal(value),
+                "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
+            }
+        };
+        let mut read_only = tx("copy", "mirror");
+        read_only.set("Ff", 1);
+        let mut hidden = tx("hidden", "secret");
+        hidden.set("F", 2);
+        let mut no_view = tx("noview", "secret");
+        no_view.set("F", 32);
+        let mut password = tx("pin", "1234");
+        password.set("Ff", 1 << 13);
+        let (doc, page_map) = form_doc(vec![
+            read_only,
+            hidden,
+            no_view,
+            password,
+            tx("empty", ""),
+            tx("kept", "Alice"),
+        ]);
+
+        assert_eq!(texts(&extract_form_fields(&doc, &page_map)), ["Alice"]);
+    }
+
+    #[test]
+    fn checkboxes_and_radios_read_as_ticked_or_unticked_boxes() {
+        let btn = |name: &str, state: &str, ff: i64| {
+            dictionary! {
+                "FT" => "Btn",
+                "Ff" => ff,
+                "T" => Object::string_literal(name),
+                "V" => Object::Name(state.as_bytes().to_vec()),
+                "AS" => Object::Name(state.as_bytes().to_vec()),
+                "Rect" => vec![10.into(), 20.into(), 18.into(), 28.into()],
+            }
+        };
+        let (doc, page_map) = form_doc(vec![
+            btn("single", "1", 0),
+            btn("joint", "Off", 0),
+            btn("yes", "Yes", 1 << 15),
+            btn("print", "Off", 1 << 16),
+        ]);
+
+        assert_eq!(
+            texts(&extract_form_fields(&doc, &page_map)),
+            ["[x]", "[ ]", "[x]"]
+        );
+    }
+
+    #[test]
+    fn kid_widgets_show_their_parent_fields_value() {
+        // A field placed twice: the value lives on the parent, the widgets
+        // are its kids. Each widget shows the value, as on the page.
+        let mut doc = Document::new();
+        let kid = |doc: &mut Document, y: i64| {
+            doc.add_object(dictionary! {
+                "Type" => "Annot",
+                "Subtype" => "Widget",
+                "Rect" => vec![10.into(), y.into(), 110.into(), (y + 14).into()],
+            })
+        };
+        let (a, b) = (kid(&mut doc, 700), kid(&mut doc, 300));
+        let parent = doc.add_object(dictionary! {
+            "FT" => "Tx",
+            "T" => Object::string_literal("name"),
+            "V" => Object::string_literal("Celeste W"),
+            "Kids" => vec![Object::Reference(a), Object::Reference(b)],
+        });
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Annots" => vec![Object::Reference(a), Object::Reference(b)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! { "Fields" => vec![Object::Reference(parent)] },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let items = extract_form_fields(&doc, &HashMap::from([(page_id, 1)]));
+        assert_eq!(texts(&items), ["Celeste W", "Celeste W"]);
+    }
+
+    #[test]
+    fn radio_kids_tick_only_the_chosen_widget() {
+        let mut doc = Document::new();
+        let kid = |doc: &mut Document, x: i64, state: &str| {
+            doc.add_object(dictionary! {
+                "Type" => "Annot",
+                "Subtype" => "Widget",
+                "AS" => Object::Name(state.as_bytes().to_vec()),
+                "Rect" => vec![x.into(), 20.into(), (x + 8).into(), 28.into()],
+            })
+        };
+        let (yes, no) = (kid(&mut doc, 10, "Off"), kid(&mut doc, 60, "2"));
+        let parent = doc.add_object(dictionary! {
+            "FT" => "Btn",
+            "Ff" => 1 << 15,
+            "T" => Object::string_literal("c1_10"),
+            "V" => Object::Name(b"2".to_vec()),
+            "Kids" => vec![Object::Reference(yes), Object::Reference(no)],
+        });
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Annots" => vec![Object::Reference(yes), Object::Reference(no)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! { "Fields" => vec![Object::Reference(parent)] },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let items = extract_form_fields(&doc, &HashMap::from([(page_id, 1)]));
+        assert_eq!(texts(&items), ["[ ]", "[x]"]);
+    }
+
+    #[test]
+    fn multiline_value_reads_as_one_item() {
+        let (doc, page_map) = form_doc(vec![dictionary! {
+            "FT" => "Tx",
+            "Ff" => 1 << 12,
+            "T" => Object::string_literal("payer"),
+            "V" => Object::string_literal("Ashbury Family Trust\r1450 Halsey Lane"),
+            "Rect" => vec![36.into(), 600.into(), 300.into(), 640.into()],
+        }]);
+
+        // One item keeps a payer's name and address together; split into
+        // lines, each joined whatever text shared its row in the next column.
+        let items = extract_form_fields(&doc, &page_map);
+        assert_eq!(texts(&items), ["Ashbury Family Trust, 1450 Halsey Lane"]);
+        // Read from the box's first line.
+        assert!(items[0].y > 620.0, "{}", items[0].y);
+    }
+
+    #[test]
+    fn value_spans_its_widget_box() {
+        // A right-aligned SSN: the value is laid over the whole box, which is
+        // where the form shows it and what table cells and columns see.
+        let (doc, page_map) = form_doc(vec![dictionary! {
+            "FT" => "Tx",
+            "Q" => 2,
+            "T" => Object::string_literal("ssn"),
+            "V" => Object::string_literal("987-65-4324"),
+            "Rect" => vec![446.4.into(), 684.into(), 576.into(), 698.into()],
+        }]);
+
+        let items = extract_form_fields(&doc, &page_map);
+        assert_eq!(texts(&items), ["987-65-4324"]);
+        assert_eq!(items[0].x, 446.4);
+        assert!((items[0].width - 129.6).abs() < 0.01, "{}", items[0].width);
+    }
+
+    // --- place_form_items ---
+
+    fn text(text: &str, x: f32, y: f32, width: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height: 8.0,
+            font: "F1".to_string(),
+            font_size: 8.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    fn value(value: &str, x: f32, y: f32, width: f32, height: f32) -> TextItem {
+        TextItem {
+            item_type: ItemType::FormField,
+            font_size: 0.0,
+            height,
+            ..text(value, x, y, width)
+        }
+    }
+
+    fn order(items: &[TextItem]) -> Vec<&str> {
+        items.iter().map(|item| item.text.as_str()).collect()
+    }
+
+    #[test]
+    fn value_follows_the_label_printed_above_its_box() {
+        // 1040 header: the labels sit above their boxes, and the content
+        // stream draws the whole page before any widget value exists.
+        let mut items = vec![
+            text("Your first name and middle initial", 36.0, 700.0, 105.0),
+            text("Last name", 256.0, 700.0, 35.0),
+            text("If joint return, spouse's first name", 36.0, 676.0, 159.0),
+            text("Home address", 36.0, 652.0, 60.0),
+        ];
+        place_form_items(
+            &mut items,
+            vec![
+                value("Celeste W", 36.0, 684.0, 215.0, 14.0),
+                value("Halvorsen-Pryce", 253.0, 684.0, 214.0, 14.0),
+            ],
+        );
+        assert_eq!(
+            order(&items),
+            [
+                "Your first name and middle initial",
+                "Celeste W",
+                "Last name",
+                "Halvorsen-Pryce",
+                "If joint return, spouse's first name",
+                "Home address",
+            ]
+        );
+        // Values take their label's text size rather than none at all.
+        assert_eq!(items[1].font_size, 8.0);
+    }
+
+    #[test]
+    fn value_is_never_larger_than_its_label() {
+        // Most of the page is set at 9pt, the box label at 7pt: a value set
+        // at the page size would outrank its label and read as a heading.
+        let mut items = vec![text("Name(s) shown on return", 36.0, 700.3, 90.0)];
+        items[0].font_size = 7.0;
+        for row in 0..5 {
+            let mut body = text(
+                "Line text set in the body size",
+                36.0,
+                600.0 - row as f32 * 12.0,
+                120.0,
+            );
+            body.font_size = 9.0;
+            items.push(body);
+        }
+        place_form_items(
+            &mut items,
+            vec![value(
+                "Celeste W. Halvorsen-Pryce",
+                36.0,
+                684.0,
+                409.6,
+                14.0,
+            )],
+        );
+
+        assert_eq!(items[1].text, "Celeste W. Halvorsen-Pryce");
+        assert_eq!(items[1].font_size, 7.0);
+    }
+
+    #[test]
+    fn value_joins_the_row_of_the_label_to_its_left() {
+        let mut items = vec![
+            text("Total amount from Form(s) W-2", 108.0, 332.0, 200.0),
+            text("1a", 489.0, 332.0, 9.0),
+            text("Household employee wages", 108.0, 320.0, 200.0),
+        ];
+        place_form_items(&mut items, vec![value("584000", 504.0, 330.0, 72.0, 12.0)]);
+
+        assert_eq!(
+            order(&items),
+            [
+                "Total amount from Form(s) W-2",
+                "1a",
+                "584000",
+                "Household employee wages"
+            ]
+        );
+        // On the label's baseline, so line grouping keeps them together.
+        assert_eq!(items[2].y, 332.0);
+    }
+
+    #[test]
+    fn checkbox_goes_before_the_option_label_to_its_right() {
+        let mut items = vec![
+            text("Filing Status", 36.0, 577.0, 50.0),
+            text("Single", 110.0, 578.3, 24.0),
+            text("Head of household (HOH)", 362.0, 578.3, 92.0),
+        ];
+        place_form_items(
+            &mut items,
+            vec![
+                value("[x]", 98.0, 578.0, 8.0, 8.0),
+                value("[ ]", 350.0, 578.0, 8.0, 8.0),
+            ],
+        );
+        assert_eq!(
+            order(&items),
+            [
+                "Filing Status",
+                "[x]",
+                "Single",
+                "[ ]",
+                "Head of household (HOH)"
+            ]
+        );
+    }
+
+    #[test]
+    fn value_under_a_label_is_as_wide_as_its_text_or_its_label() {
+        // Form 4952's name box runs most of the page width. Laid over all of
+        // it, the value straddled the header's columns and was read apart
+        // from its label; at least as wide as the label, it shares the
+        // label's column and table cell.
+        let mut items = vec![
+            text("Name(s) shown on return", 36.0, 700.0, 189.4),
+            text("Identifying number", 464.8, 700.0, 64.5),
+        ];
+        place_form_items(
+            &mut items,
+            vec![
+                value("Celeste W. Halvorsen-Pryce", 36.0, 688.9, 424.1, 14.0),
+                value("987-65-4324", 460.8, 688.9, 115.2, 14.0),
+            ],
+        );
+        assert_eq!(items[1].text, "Celeste W. Halvorsen-Pryce");
+        assert_eq!((items[1].x, items[1].width), (36.0, 189.4));
+        assert_eq!(items[3].text, "987-65-4324");
+        assert_eq!((items[3].x, items[3].width), (460.8, 64.5));
+    }
+
+    #[test]
+    fn value_beside_a_row_label_is_as_wide_as_its_text() {
+        let mut items = vec![text("1a", 489.0, 332.0, 9.0)];
+        place_form_items(&mut items, vec![value("584000", 504.0, 330.0, 72.0, 12.0)]);
+        assert_eq!(items[1].x, 504.0);
+        assert_eq!(items[1].width, 6.0 * 8.0 * 0.5);
+    }
+
+    #[test]
+    fn value_on_a_page_without_text_is_kept() {
+        let mut items = Vec::new();
+        place_form_items(&mut items, vec![value("Alice", 36.0, 684.0, 215.0, 14.0)]);
+        assert_eq!(order(&items), ["Alice"]);
     }
 }

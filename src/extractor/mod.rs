@@ -272,6 +272,13 @@ fn extract_positioned_text_impl(
     let page_id_to_num: HashMap<ObjectId, u32> =
         pages.iter().map(|(num, &id)| (id, *num)).collect();
 
+    // AcroForm field values, grouped by page so each page can read them in
+    // place among its own text.
+    let mut page_form_items: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    for item in extract_form_fields(doc, &page_id_to_num) {
+        page_form_items.entry(item.page).or_default().push(item);
+    }
+
     for (page_num, &page_id) in pages.iter() {
         if let Some(filter) = page_filter {
             if !filter.contains(page_num) {
@@ -410,8 +417,12 @@ fn extract_positioned_text_impl(
             }
         }
         // Rotated pages keep content in a turned frame, where "above" is not
-        // up the page.
-        if !coords_rotated {
+        // up the page and widget rects do not line up with the text.
+        let form_items = page_form_items.remove(page_num).unwrap_or_default();
+        if coords_rotated {
+            items.extend(form_items);
+        } else {
+            links::place_form_items(&mut items, form_items);
             checkboxes::attach_checkbox_labels(&mut items);
         }
         all_items.extend(items);
@@ -434,11 +445,7 @@ fn extract_positioned_text_impl(
         all_items.extend(links);
     }
 
-    // Extract AcroForm field values
-    let form_items = extract_form_fields(doc, &page_id_to_num)
-        .into_iter()
-        .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)));
-    all_items.extend(form_items);
+    // AcroForm field values were spliced into their pages above.
 
     Ok((
         (all_items, all_rects, all_lines),
@@ -1760,6 +1767,22 @@ mod tests {
 
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text(), "Total 730 seats");
+    }
+
+    #[test]
+    fn filled_form_value_at_page_edge_is_not_a_page_number() {
+        // Schedule D line 13 sits near the foot of the page; its filled
+        // amount is the reader's data, never a folio.
+        let mut amount = make_merge_item("5205", 559.6, 20.0);
+        amount.y = 50.0;
+        amount.item_type = ItemType::FormField;
+        let mut label = make_merge_item("Capital gain distributions", 60.0, 100.0);
+        label.y = 50.0;
+
+        let lines = group_into_lines(vec![label, amount]);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text(), "Capital gain distributions 5205");
     }
 
     #[test]

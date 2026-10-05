@@ -147,6 +147,13 @@ pub(crate) fn is_checkbox_token(text: &str) -> bool {
     matches!(text.trim(), "[x]" | "[ ]")
 }
 
+/// Text that opens with a checkbox token, such as a box joined with its
+/// option label ("[x] Single"): always the start of a new word.
+pub(crate) fn starts_with_checkbox(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("[x]") || text.starts_with("[ ]")
+}
+
 /// A checkbox token, alone or carrying the Yes/No answer-column header it
 /// sits under (`[x] No`). Such a mark belongs to its question's line, so it
 /// takes no part in column detection.

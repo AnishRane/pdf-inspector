@@ -1079,10 +1079,8 @@ const ADJACENT_PAGE_MIN_CONTENT_WIDTH_EM: f32 = 26.0;
 type ContextualCandidateOccurrence = (u32, f32, Vec<(usize, u32)>);
 
 fn page_number_value(item: &TextItem) -> Option<u32> {
-    if !matches!(
-        item.item_type,
-        crate::types::ItemType::Text | crate::types::ItemType::FormField
-    ) {
+    // A filled form field's value is the reader's data, never a folio.
+    if !matches!(item.item_type, crate::types::ItemType::Text) {
         return None;
     }
 

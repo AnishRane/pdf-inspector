@@ -309,7 +309,7 @@ impl TextLine {
         // A checkbox token stands apart from its label even when its glyph
         // is set smaller and higher, which would otherwise read as a
         // superscript run.
-        if crate::text_utils::is_checkbox_mark(text)
+        if crate::text_utils::starts_with_checkbox(text)
             || crate::text_utils::is_checkbox_mark(&prev_item.text)
         {
             return !(result.ends_with(' ') || text.starts_with(' '));
@@ -446,6 +446,25 @@ mod formatting_tests {
         ]);
 
         assert_eq!(line.text(), "Publicly traded? ..... [x] No");
+    }
+
+    #[test]
+    fn labelled_checkbox_starts_a_new_word() {
+        // "[x] Single" set smaller and a little higher than the heading
+        // before it, which reads like a subscript run.
+        let heading = TextItem {
+            font_size: 10.0,
+            y: 577.0,
+            ..item("Filing Status", 36.0, 58.0, false)
+        };
+        let option = TextItem {
+            font_size: 8.0,
+            y: 578.3,
+            ..item("[x] Single", 98.0, 36.0, false)
+        };
+        let line = line(vec![heading, option]);
+
+        assert_eq!(line.text(), "Filing Status [x] Single");
     }
 
     #[test]

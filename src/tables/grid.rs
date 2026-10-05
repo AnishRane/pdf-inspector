@@ -381,7 +381,7 @@ pub(crate) fn join_cell_items(items: &[&TextItem]) -> String {
 
             // A checkbox token is a word of its own even when its glyph is
             // set smaller and higher than the label beside it.
-            let checkbox = crate::text_utils::is_checkbox_mark(text)
+            let checkbox = crate::text_utils::starts_with_checkbox(text)
                 || crate::text_utils::is_checkbox_mark(&prev_item.text);
             // Current item is subscript/superscript (smaller than previous)
             let is_sub_super = !checkbox && font_ratio < 0.85 && y_diff > 1.0;
