@@ -210,6 +210,14 @@ pub(crate) fn extract_form_fields(
         return items;
     }
     let annotation_pages = annotation_page_map(doc, page_map);
+    let page_boxes: HashMap<u32, PageBox> = page_map
+        .iter()
+        .filter_map(|(&page_id, &page)| super::get_page_box(doc, page_id).map(|b| (page, b)))
+        .collect();
+    let inherited = Inherited {
+        appearance: acroform.get(b"DA").ok().and_then(|o| o.as_str().ok()),
+        ..Inherited::default()
+    };
 
     // Bound the walk so a crafted PDF cannot send us into unbounded recursion
     // via a `/Kids` cycle, a deep chain, or an oversized array of invalid or
@@ -228,10 +236,11 @@ pub(crate) fn extract_form_fields(
             walk_form_fields(
                 doc,
                 field_ref,
-                Inherited::default(),
+                inherited,
                 "",
                 page_map,
                 &annotation_pages,
+                &page_boxes,
                 &mut items,
                 &mut budget,
                 0,
@@ -243,13 +252,18 @@ pub(crate) fn extract_form_fields(
 }
 
 /// Field attributes a widget inherits from its ancestor fields
-/// (ISO 32000-1 12.7.3.1): field type, field flags and value.
+/// (ISO 32000-1 12.7.3.1): field type, field flags, value and default
+/// appearance string (`/DA`, which the AcroForm dictionary defaults).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Inherited<'a> {
     ft: Option<&'a [u8]>,
     flags: i64,
     value: Option<&'a Object>,
+    appearance: Option<&'a [u8]>,
 }
+
+/// A page's visible box: `(x0, y0, x1, y1)`.
+type PageBox = (f32, f32, f32, f32);
 
 // Field flags (`/Ff`, ISO 32000-1 tables 226 and 228).
 const FF_MULTILINE: i64 = 1 << 12;
@@ -293,6 +307,7 @@ pub(crate) fn walk_form_fields<'a>(
     parent_name: &str,
     page_map: &HashMap<ObjectId, u32>,
     annotation_pages: &HashMap<ObjectId, u32>,
+    page_boxes: &HashMap<u32, PageBox>,
     items: &mut Vec<TextItem>,
     budget: &mut FieldWalkBudget,
     depth: usize,
@@ -338,6 +353,11 @@ pub(crate) fn walk_form_fields<'a>(
             .and_then(|o| doc.dereference(o).ok())
             .map(|(_, o)| o)
             .or(inherited.value),
+        appearance: field_dict
+            .get(b"DA")
+            .ok()
+            .and_then(|o| o.as_str().ok())
+            .or(inherited.appearance),
     };
 
     // Check for /Kids — if present, recurse into children
@@ -363,6 +383,7 @@ pub(crate) fn walk_form_fields<'a>(
                         &full_name,
                         page_map,
                         annotation_pages,
+                        page_boxes,
                         items,
                         budget,
                         depth + 1,
@@ -426,16 +447,12 @@ pub(crate) fn walk_form_fields<'a>(
             if flags & FF_PUSHBUTTON != 0 {
                 return;
             }
-            // The widget's appearance state says whether this box shows its
-            // check; a radio group's kids share one value, so only `/AS`
-            // tells them apart.
-            let state = field_dict
-                .get(b"AS")
-                .ok()
-                .or(inherited.value)
-                .and_then(|o| o.as_name().ok());
-            let checked = state.is_some_and(|name| name != b"Off");
-            if checked { "[x]" } else { "[ ]" }.to_string()
+            if is_checked(doc, field_dict, inherited.value) {
+                "[x]"
+            } else {
+                "[ ]"
+            }
+            .to_string()
         }
         _ => return,
     };
@@ -466,6 +483,15 @@ pub(crate) fn walk_form_fields<'a>(
         .and_then(|p| page_map.get(&p).copied())
         .or_else(|| annotation_pages.get(&field_id).copied())
         .unwrap_or(1);
+
+    // A value no reader can see must not read as printed text: a widget with
+    // no area or off the page, or text inked white or set too small to read.
+    let off_page = page_boxes
+        .get(&page_num)
+        .is_some_and(|&(x0, y0, x1, y1)| x + width <= x0 || x >= x1 || y + height <= y0 || y >= y1);
+    if width < 0.5 || height < 0.5 || off_page || inherited.appearance.is_some_and(hides_text) {
+        return;
+    }
 
     debug!(
         "form field {:?} = {:?} on page {} at ({:.1}, {:.1}, {:.1}x{:.1})",
@@ -503,6 +529,91 @@ pub(crate) fn walk_form_fields<'a>(
         item_type: ItemType::FormField,
         mcid: None,
     });
+}
+
+/// Whether a checkbox or radio widget shows its check.
+///
+/// The field value `/V` decides: the widget is ticked when `/V` names its
+/// own on-state (the non-`Off` appearance in `/AP /N`, else its `/AS`). The
+/// appearance state `/AS` is what a viewer regenerates from `/V`, so when
+/// the two disagree (`/V /Off` with `/AS /Yes`, a stale appearance) the
+/// value wins. Without a `/V`, `/AS` alone decides.
+fn is_checked(doc: &Document, widget: &lopdf::Dictionary, value: Option<&Object>) -> bool {
+    let appearance = widget.get(b"AS").ok().and_then(|o| o.as_name().ok());
+    let on_state: Option<Vec<u8>> = widget
+        .get(b"AP")
+        .ok()
+        .and_then(|ap| resolve_dict(doc, ap))
+        .and_then(|ap| ap.get(b"N").ok())
+        .and_then(|normal| resolve_dict(doc, normal))
+        .and_then(|normal| {
+            normal
+                .iter()
+                .map(|(name, _)| name)
+                .find(|name| name.as_slice() != b"Off")
+                .cloned()
+        })
+        .or_else(|| {
+            appearance
+                .filter(|name| *name != b"Off")
+                .map(<[u8]>::to_vec)
+        });
+    match value.and_then(|v| v.as_name().ok()) {
+        Some(b"Off") => false,
+        Some(value) => match on_state {
+            Some(on) => on.as_slice() == value,
+            // No on-state is known and the appearance is Off: a radio kid
+            // other than the chosen one.
+            None => appearance.is_none(),
+        },
+        None => appearance.is_some_and(|name| name != b"Off"),
+    }
+}
+
+/// Whether a default appearance string (`/DA`, e.g. `/Helv 10 Tf 0 g`) draws
+/// text no reader can see: inked white, or set under 2pt (size 0 means
+/// auto-sized, which is readable).
+fn hides_text(appearance: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(appearance);
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    let numbers_before = |at: usize, count: usize| -> Option<Vec<f32>> {
+        (at >= count)
+            .then(|| {
+                tokens[at - count..at]
+                    .iter()
+                    .map(|t| t.parse().ok())
+                    .collect()
+            })
+            .flatten()
+    };
+    // The last colour set is the one the text is drawn in.
+    let (mut tiny, mut white) = (false, false);
+    for (at, token) in tokens.iter().enumerate() {
+        match *token {
+            "Tf" => {
+                if let Some(size) = numbers_before(at, 1) {
+                    tiny = size[0] > 0.0 && size[0] < 2.0;
+                }
+            }
+            "g" => {
+                if let Some(gray) = numbers_before(at, 1) {
+                    white = gray[0] >= 0.99;
+                }
+            }
+            "rg" => {
+                if let Some(rgb) = numbers_before(at, 3) {
+                    white = rgb.iter().all(|&c| c >= 0.99);
+                }
+            }
+            "k" => {
+                if let Some(cmyk) = numbers_before(at, 4) {
+                    white = cmyk.iter().all(|&c| c <= 0.01);
+                }
+            }
+            _ => {}
+        }
+    }
+    tiny || white
 }
 
 /// The field's fully qualified name: its ancestors' partial names and its
@@ -1225,6 +1336,89 @@ mod tests {
         assert_eq!(texts(&items), ["987-65-4324"]);
         assert_eq!(items[0].x, 446.4);
         assert!((items[0].width - 129.6).abs() < 0.01, "{}", items[0].width);
+    }
+
+    /// A text widget on a 612x792 page, with `extra` entries set on it.
+    fn visible_doc(extra: Vec<(&str, Object)>) -> (Document, HashMap<ObjectId, u32>) {
+        let mut widget = dictionary! {
+            "FT" => "Tx",
+            "T" => Object::string_literal("field"),
+            "V" => Object::string_literal("Your social security number"),
+            "DA" => Object::string_literal("/Helv 10 Tf 0 g"),
+            "Rect" => vec![36.into(), 684.into(), 251.into(), 698.into()],
+        };
+        for (key, value) in extra {
+            widget.set(key, value);
+        }
+        let mut doc = Document::new();
+        let id = doc.add_object(widget);
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Annots" => vec![Object::Reference(id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "AcroForm" => dictionary! { "Fields" => vec![Object::Reference(id)] },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+        (doc, HashMap::from([(page_id, 1)]))
+    }
+
+    #[test]
+    fn widget_a_reader_can_see_keeps_its_value() {
+        let (doc, page_map) = visible_doc(vec![]);
+        assert_eq!(extract_form_fields(&doc, &page_map).len(), 1);
+        // An auto-sized font (size 0) is drawn at a readable size.
+        let (doc, page_map) = visible_doc(vec![("DA", Object::string_literal("/Helv 0 Tf 0 g"))]);
+        assert_eq!(extract_form_fields(&doc, &page_map).len(), 1);
+    }
+
+    #[test]
+    fn widgets_no_reader_can_see_emit_nothing() {
+        // Values a person never sees must not read as printed text: a widget
+        // off the page, one with no area, one inked white, one set too small
+        // to read.
+        let invisible = [
+            (
+                "Rect",
+                vec![700.into(), 684.into(), 800.into(), 698.into()].into(),
+            ),
+            (
+                "Rect",
+                vec![36.into(), 684.into(), 36.into(), 698.into()].into(),
+            ),
+            ("DA", Object::string_literal("/Helv 10 Tf 1 g")),
+            ("DA", Object::string_literal("/Helv 10 Tf 1 1 1 rg")),
+            ("DA", Object::string_literal("/Helv 10 Tf 0 0 0 0 k")),
+            ("DA", Object::string_literal("/Helv 1 Tf 0 g")),
+            ("DA", Object::string_literal("1 g /Helv 10 Tf")),
+        ];
+        for (key, value) in invisible {
+            let (doc, page_map) = visible_doc(vec![(key, value.clone())]);
+            assert!(
+                extract_form_fields(&doc, &page_map).is_empty(),
+                "{key} {value:?} should hide the value"
+            );
+        }
+    }
+
+    #[test]
+    fn checkbox_state_follows_the_field_value() {
+        // /V is the field's value; /AS is the appearance a viewer should
+        // regenerate from it. When they disagree, the value wins.
+        let checkbox = |value: &str, appearance: &str| {
+            dictionary! {
+                "FT" => "Btn",
+                "T" => Object::string_literal("box"),
+                "V" => Object::Name(value.as_bytes().to_vec()),
+                "AS" => Object::Name(appearance.as_bytes().to_vec()),
+                "AP" => dictionary! { "N" => dictionary! { "Yes" => Object::Null, "Off" => Object::Null } },
+                "Rect" => vec![10.into(), 20.into(), 18.into(), 28.into()],
+            }
+        };
+        let (doc, page_map) = form_doc(vec![checkbox("Off", "Yes"), checkbox("Yes", "Off")]);
+        assert_eq!(texts(&extract_form_fields(&doc, &page_map)), ["[ ]", "[x]"]);
     }
 
     // --- place_form_items ---
