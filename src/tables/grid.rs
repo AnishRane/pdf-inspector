@@ -379,10 +379,14 @@ pub(crate) fn join_cell_items(items: &[&TextItem]) -> String {
             let reverse_font_ratio = prev_item.font_size / item.font_size;
             let y_diff = (item.y - prev_item.y).abs();
 
+            // A checkbox token is a word of its own even when its glyph is
+            // set smaller and higher than the label beside it.
+            let checkbox = crate::text_utils::is_checkbox_mark(text)
+                || crate::text_utils::is_checkbox_mark(&prev_item.text);
             // Current item is subscript/superscript (smaller than previous)
-            let is_sub_super = font_ratio < 0.85 && y_diff > 1.0;
+            let is_sub_super = !checkbox && font_ratio < 0.85 && y_diff > 1.0;
             // Previous item was subscript/superscript (returning to normal size)
-            let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0;
+            let was_sub_super = !checkbox && reverse_font_ratio < 0.85 && y_diff > 1.0;
 
             if prev_ends_with_hyphen
                 || curr_is_hyphen
@@ -753,6 +757,16 @@ mod tests {
         let a = make_item("H", 100.0, 500.0, 12.0);
         let b = make_item("2", 110.0, 497.0, 8.0); // smaller font, Y offset
         assert_eq!(join_cell_items(&[&a, &b]), "H2");
+    }
+
+    #[test]
+    fn test_join_cell_items_spaces_raised_checkbox() {
+        // A tick glyph set smaller and higher than its label is a word of
+        // its own, not a superscript.
+        let a = make_item("Yes", 72.0, 74.0, 7.0);
+        let b = make_item("[x]", 102.4, 75.8, 5.6);
+        let c = make_item("No", 115.2, 74.0, 7.0);
+        assert_eq!(join_cell_items(&[&a, &b, &c]), "Yes [x] No");
     }
 
     #[test]

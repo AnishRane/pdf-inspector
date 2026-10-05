@@ -1710,7 +1710,11 @@ pub(crate) fn assign_items_to_grid(
         }
     }
 
-    // Build cell strings: sort items within each cell by Y descending then X ascending
+    // Build cell strings: read each cell top to bottom, one visual line at a
+    // time, left to right within a line. Baselines a few points apart share a
+    // line, so a raised tick glyph or superscript stays between the words it
+    // sits among instead of jumping to the front of the line.
+    const CELL_LINE_TOLERANCE: f32 = 3.0;
     let mut cells: Vec<Vec<String>> = Vec::with_capacity(num_rows);
     for row_items in &mut cell_items {
         let mut row_cells = Vec::with_capacity(num_cols);
@@ -1725,6 +1729,15 @@ pub(crate) fn assign_items_to_grid(
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
             });
+            let mut line_start = 0;
+            for i in 1..=col_items.len() {
+                if i == col_items.len()
+                    || col_items[line_start].1.y - col_items[i].1.y > CELL_LINE_TOLERANCE
+                {
+                    col_items[line_start..i].sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+                    line_start = i;
+                }
+            }
             let text = col_items
                 .iter()
                 .map(|(_, item)| item.text.trim())
@@ -1746,6 +1759,12 @@ fn remove_inner_delimiter_spaces(text: &str) -> String {
 
     for (i, &ch) in chars.iter().enumerate() {
         if ch == ' ' {
+            // "[ ]" is an unticked checkbox, not an empty bracket pair.
+            let empty_checkbox = result.ends_with('[') && chars.get(i + 1) == Some(&']');
+            if empty_checkbox {
+                result.push(ch);
+                continue;
+            }
             let after_open =
                 result.ends_with('(') || result.ends_with('[') || result.ends_with('{');
             let before_close = chars
@@ -4184,6 +4203,34 @@ mod tests {
         assert_eq!(cells[1][0], "C");
         assert_eq!(cells[1][1], "D");
         assert_eq!(indices.len(), 4);
+    }
+
+    #[test]
+    fn test_assign_items_keeps_raised_tick_between_its_neighbours() {
+        // A flattened form's tick glyph sits ~2pt above the label baseline.
+        // Sorting strictly by y pulled it ahead of "Yes", so a ticked "No"
+        // read as "[x] Yes No".
+        let items = vec![
+            make_item("Yes", 72.0, 74.0, 7.0),
+            make_item("[x]", 102.4, 75.8, 6.4),
+            make_item("No", 115.2, 74.0, 7.0),
+        ];
+        let col_edges = vec![60.0, 200.0];
+        let row_edges = vec![90.0, 60.0];
+        let (cells, _) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert_eq!(cells[0][0], "Yes [x] No");
+    }
+
+    #[test]
+    fn test_assign_items_keeps_empty_checkbox_intact() {
+        let items = vec![
+            make_item("[ ]", 62.0, 74.0, 7.0),
+            make_item("Single", 75.0, 74.0, 7.0),
+        ];
+        let col_edges = vec![60.0, 200.0];
+        let row_edges = vec![90.0, 60.0];
+        let (cells, _) = assign_items_to_grid(&items, &col_edges, &row_edges, 1);
+        assert_eq!(cells[0][0], "[ ] Single");
     }
 
     #[test]

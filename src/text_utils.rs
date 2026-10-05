@@ -142,6 +142,21 @@ where
     rtl > 0 && rtl > ltr
 }
 
+/// A form checkbox rendered as text: `[x]` ticked, `[ ]` unticked.
+pub(crate) fn is_checkbox_token(text: &str) -> bool {
+    matches!(text.trim(), "[x]" | "[ ]")
+}
+
+/// A checkbox token, alone or carrying the Yes/No answer-column header it
+/// sits under (`[x] No`). Such a mark belongs to its question's line, so it
+/// takes no part in column detection.
+pub(crate) fn is_checkbox_mark(text: &str) -> bool {
+    let text = text.trim();
+    text.strip_prefix("[x]")
+        .or_else(|| text.strip_prefix("[ ]"))
+        .is_some_and(|rest| matches!(rest.trim(), "" | "Yes" | "No"))
+}
+
 pub(crate) fn sort_line_items(items: &mut [TextItem]) {
     let rtl = is_rtl_text(items.iter().map(|i| &i.text));
     if rtl {

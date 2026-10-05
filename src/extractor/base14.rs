@@ -55,6 +55,12 @@ pub(crate) fn builtin_encoding_char(base_font: &str, code: u8) -> Option<char> {
         .map(|i| enc[i].1)
 }
 
+/// True when the base font name normalizes to ZapfDingbats (or one of its
+/// ITC/Dingbats aliases).
+pub(crate) fn is_zapf_dingbats(base_font: &str) -> bool {
+    base14_table(base_font).is_some_and(|table| std::ptr::eq(table, ZAPFDINGBATS))
+}
+
 /// Map a BaseFont name (possibly subset-prefixed, e.g. "ABCDEF+Times-Bold",
 /// or a common alias like "Arial" / "TimesNewRomanPSMT") to its width table.
 fn base14_table(base_font: &str) -> Option<&'static [(char, u16)]> {

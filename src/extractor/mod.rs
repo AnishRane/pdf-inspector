@@ -3,6 +3,7 @@
 //! This module extracts text with position information for structure detection.
 
 mod base14;
+mod checkboxes;
 mod content_decode;
 pub(crate) mod content_stream;
 mod fonts;
@@ -407,6 +408,11 @@ fn extract_positioned_text_impl(
                     trace_text_preview(&item.text, 80)
                 );
             }
+        }
+        // Rotated pages keep content in a turned frame, where "above" is not
+        // up the page.
+        if !coords_rotated {
+            checkboxes::attach_checkbox_labels(&mut items);
         }
         all_items.extend(items);
         all_rects.extend(rects);

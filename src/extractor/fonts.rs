@@ -1322,6 +1322,14 @@ pub(crate) fn extract_text_from_operand(
                 }
             }
 
+            // ZapfDingbats draws through its built-in encoding, so with no
+            // ToUnicode or Differences entry that encoding is the only
+            // faithful reading: byte 0x34 is ✔, not the digit a Latin
+            // decode reads there.
+            if let Some(text) = decode_zapf_dingbats_builtin(bytes, base_font_name) {
+                return Some(text);
+            }
+
             // Fallback: try UTF-16BE then Latin-1
             if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
                 let utf16: Vec<u16> = bytes[2..]
@@ -1415,8 +1423,47 @@ pub(crate) fn extract_text_from_operand(
     result.map(|text| {
         let text = clean_symbol_pua(text);
         let text = remap_texcm_math_symbols(text, base_font_name);
+        let text = normalize_dingbat_checkboxes(text, base_font_name);
         normalize_cp1252_controls(text, use_cp1252_fallback)
     })
+}
+
+/// Decode a ZapfDingbats string through the font's built-in encoding.
+/// `None` for any other font.
+fn decode_zapf_dingbats_builtin(bytes: &[u8], base_font_name: Option<&str>) -> Option<String> {
+    let base_font =
+        base_font_name.filter(|name| crate::extractor::base14::is_zapf_dingbats(name))?;
+    let text: String = bytes
+        .iter()
+        .filter_map(|&b| crate::extractor::base14::builtin_encoding_char(base_font, b))
+        .collect();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Form checkboxes drawn in ZapfDingbats tick with a check mark or a
+/// multiplication cross (✓ ✔ ✕ ✖) and show an empty ballot box (❏ ❐ ❑ ❒)
+/// unticked. Write them as `[x]` / `[ ]` so the box state survives as text.
+/// Other dingbats keep their symbol: the ballot X (✗ ✘) is the "no" mark that
+/// pairs with ✓ in comparison tables, and ● often serves as a bullet.
+fn normalize_dingbat_checkboxes(text: String, base_font_name: Option<&str>) -> String {
+    let is_tick = |c: char| ('\u{2713}'..='\u{2716}').contains(&c);
+    let is_empty_box = |c: char| ('\u{274F}'..='\u{2752}').contains(&c);
+    if !base_font_name.is_some_and(crate::extractor::base14::is_zapf_dingbats)
+        || !text.chars().any(|c| is_tick(c) || is_empty_box(c))
+    {
+        return text;
+    }
+    let mut out = String::with_capacity(text.len() + 4);
+    for c in text.chars() {
+        if is_tick(c) {
+            out.push_str("[x]");
+        } else if is_empty_box(c) {
+            out.push_str("[ ]");
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Fix a known producer bug in "TeXCMMathsSymbols" subset fonts (IntechOpen
@@ -2222,6 +2269,83 @@ mod tests {
         .expect("simple font should decode CP1252 punctuation");
 
         assert_eq!(text, "l’acad");
+    }
+
+    /// Decode `bytes` shown in a simple font with no ToUnicode, Differences
+    /// or cached encoding, as a non-embedded base-14 font is.
+    fn decode_simple_font(bytes: &[u8], base_font: &str) -> Option<String> {
+        let obj = Object::String(bytes.to_vec(), lopdf::StringFormat::Literal);
+        let font_widths: PageFontWidths = HashMap::new();
+        extract_text_from_operand(
+            &obj,
+            "F1",
+            Some(base_font),
+            &FontCMaps::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut CMapDecisionCache::new(),
+            &font_widths,
+        )
+    }
+
+    #[test]
+    fn zapf_dingbats_check_glyph_reads_as_ticked_box() {
+        // Flattened form checkboxes draw ZapfDingbats 0x34 (✔, glyph a20).
+        // A Latin decode reads that byte as the digit "4", so a ticked
+        // "Single" box came out as "4 Single".
+        assert_eq!(
+            decode_simple_font(b"4", "ZapfDingbats").as_deref(),
+            Some("[x]")
+        );
+        // The cross style (0x36, ✖) ticks a box just the same.
+        assert_eq!(
+            decode_simple_font(b"6", "ABCDEF+ZapfDingbats").as_deref(),
+            Some("[x]")
+        );
+    }
+
+    #[test]
+    fn zapf_dingbats_ballot_x_keeps_its_symbol() {
+        // Ballot X (0x37 ✗, 0x38 ✘) is the "no" mark that pairs with ✓ in
+        // comparison tables; reading it as a ticked box would invert it.
+        assert_eq!(
+            decode_simple_font(b"7", "ZapfDingbats").as_deref(),
+            Some("\u{2717}")
+        );
+        assert_eq!(
+            decode_simple_font(b"8", "ZapfDingbats").as_deref(),
+            Some("\u{2718}")
+        );
+    }
+
+    #[test]
+    fn zapf_dingbats_empty_box_glyph_reads_as_unticked_box() {
+        // 0x6F renders ❏, an empty ballot box.
+        assert_eq!(
+            decode_simple_font(b"o", "ZapfDingbats").as_deref(),
+            Some("[ ]")
+        );
+    }
+
+    #[test]
+    fn zapf_dingbats_other_glyphs_map_to_their_symbols() {
+        // 0x6C renders ● — commonly a bullet, so it stays a symbol rather
+        // than claiming a ticked box.
+        assert_eq!(
+            decode_simple_font(b"l", "ZapfDingbats").as_deref(),
+            Some("\u{25CF}")
+        );
+    }
+
+    #[test]
+    fn digits_in_text_fonts_are_not_read_as_ticks() {
+        assert_eq!(decode_simple_font(b"4", "Helvetica").as_deref(), Some("4"));
+        assert_eq!(
+            decode_simple_font(b"4 Single", "Helvetica-Bold").as_deref(),
+            Some("4 Single")
+        );
     }
 
     #[test]

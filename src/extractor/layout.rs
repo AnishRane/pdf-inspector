@@ -30,10 +30,16 @@ pub(crate) fn detect_columns(
     const NOISE_FRACTION: f32 = 0.15;
 
     // Get items for this page. Strip Image placeholders — an image's left edge
-    // would otherwise count toward the column projection profile.
+    // would otherwise count toward the column projection profile. Checkbox
+    // marks are skipped too: a Yes/No answer column of ticks belongs to the
+    // question lines beside it, not to a text flow of its own.
     let page_items: Vec<&TextItem> = items
         .iter()
-        .filter(|i| i.page == page && crate::extractor::is_text_layout_item(i))
+        .filter(|i| {
+            i.page == page
+                && crate::extractor::is_text_layout_item(i)
+                && !crate::text_utils::is_checkbox_mark(&i.text)
+        })
         .collect();
 
     if page_items.is_empty() {
@@ -2211,19 +2217,11 @@ fn group_into_lines_with_thresholds_and_regions_impl(
             // Process each column's items independently, preserving column identity.
             // Assign each item to the column with greatest horizontal overlap
             // (instead of center-point) to avoid gutter mis-assignment.
+            // A checkbox mark goes with the question it answers instead.
             let mut col_buckets: Vec<Vec<TextItem>> = vec![Vec::new(); columns.len()];
             for item in &column_items {
-                let item_left = item.x;
-                let item_right = item.x + effective_width(item);
-                let mut best_col = 0;
-                let mut best_overlap = f32::NEG_INFINITY;
-                for (ci, col) in columns.iter().enumerate() {
-                    let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
-                    if overlap > best_overlap {
-                        best_overlap = overlap;
-                        best_col = ci;
-                    }
-                }
+                let best_col = answer_mark_column(item, &column_items, &columns)
+                    .unwrap_or_else(|| overlap_column(item, &columns));
                 col_buckets[best_col].push(item.clone());
             }
 
@@ -2370,6 +2368,48 @@ fn group_into_lines_with_thresholds_and_regions_impl(
     }
 
     all_lines
+}
+
+/// The column with the greatest horizontal overlap with the item.
+fn overlap_column(item: &TextItem, columns: &[ColumnRegion]) -> usize {
+    let item_left = item.x;
+    let item_right = item.x + effective_width(item);
+    let mut best_col = 0;
+    let mut best_overlap = f32::NEG_INFINITY;
+    for (ci, col) in columns.iter().enumerate() {
+        let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
+        if overlap > best_overlap {
+            best_overlap = overlap;
+            best_col = ci;
+        }
+    }
+    best_col
+}
+
+/// Column of the question a checkbox mark answers: the column holding the
+/// nearest item left of the mark on its row, when that item ends within an
+/// inch of the mark (a question's dot leaders run up to its answer column).
+/// Answer columns of ticks sit in the right margin, and on a page that also
+/// splits into columns they would otherwise be read after every question.
+fn answer_mark_column(
+    mark: &TextItem,
+    items: &[TextItem],
+    columns: &[ColumnRegion],
+) -> Option<usize> {
+    if !crate::text_utils::is_checkbox_mark(&mark.text) {
+        return None;
+    }
+    let right_edge = |item: &TextItem| item.x + effective_width(item);
+    let question = items
+        .iter()
+        .filter(|item| {
+            (item.y - mark.y).abs() <= 3.0
+                && right_edge(item) <= mark.x + 1.0
+                && mark.x - right_edge(item) <= 72.0
+                && !crate::text_utils::is_checkbox_mark(&item.text)
+        })
+        .max_by(|a, b| right_edge(a).total_cmp(&right_edge(b)))?;
+    Some(overlap_column(question, columns))
 }
 
 /// Determine if Y-sorting should be used instead of stream order.
@@ -2606,6 +2646,104 @@ mod tests {
         ];
         let lines = group_single_column(items, 0.10);
         assert_eq!(lines.len(), 1, "numbered table cells stay on one line");
+    }
+
+    #[test]
+    fn answer_column_of_checkboxes_is_not_a_text_column() {
+        // IRS question lists (Schedule B, "Other Information") tick answers
+        // in a narrow Yes/No column at the right margin. The ticks are marks
+        // on their question's line, not a second flow of text: splitting them
+        // off printed every tick after all the questions.
+        let mut items = vec![
+            make_item(1, 535.6, 722.6, "Yes"),
+            make_item(1, 559.1, 722.6, "No"),
+        ];
+        for row in 0..50 {
+            let y = 700.0 - row as f32 * 12.0;
+            items.push(make_item(1, 40.0, y, &"q".repeat(80)));
+            if row % 3 == 0 {
+                let mut tick = make_item(1, 561.6, y, "[x]");
+                tick.width = 7.1;
+                items.push(tick);
+            }
+        }
+        let cols = detect_columns(&items, 1, false);
+        assert!(cols.len() <= 1, "expected one column, got {cols:?}");
+    }
+
+    #[test]
+    fn answer_mark_joins_the_column_of_its_question() {
+        // A Schedule B page whose right margin holds a small table of its own
+        // (percentages owned), so the page genuinely splits at x=537. A tick
+        // in that margin still answers the question whose dot leaders run up
+        // to it, and must be read on that question's line.
+        let columns = vec![
+            ColumnRegion {
+                x_min: 40.0,
+                x_max: 537.0,
+            },
+            ColumnRegion {
+                x_min: 537.0,
+                x_max: 576.0,
+            },
+        ];
+        let mut dots = make_item(1, 504.1, 627.6, ".");
+        dots.width = 14.5;
+        let mut tick = make_item(1, 561.6, 627.2, "[x] No");
+        tick.width = 7.1;
+        let items = vec![
+            make_item(1, 40.0, 627.6, "Is the partnership"),
+            dots,
+            tick.clone(),
+        ];
+
+        assert_eq!(answer_mark_column(&tick, &items, &columns), Some(0));
+    }
+
+    #[test]
+    fn answer_mark_ignores_a_distant_item_on_its_row() {
+        // Form 706 line 2b: the box sits under "Check here if retired" in the
+        // right column; the only item at its height is another field's
+        // entry far across the page.
+        let columns = vec![
+            ColumnRegion {
+                x_min: 40.0,
+                x_max: 470.0,
+            },
+            ColumnRegion {
+                x_min: 470.0,
+                x_max: 576.0,
+            },
+        ];
+        let mut tick = make_item(1, 521.0, 557.1, "[x]");
+        tick.width = 4.7;
+        let mut entry = make_item(1, 66.8, 554.2, "Investor and philanthropist");
+        entry.width = 103.1;
+        let items = vec![entry, tick.clone()];
+
+        assert_eq!(answer_mark_column(&tick, &items, &columns), None);
+    }
+
+    #[test]
+    fn answer_mark_without_a_question_keeps_its_own_column() {
+        let columns = vec![
+            ColumnRegion {
+                x_min: 40.0,
+                x_max: 537.0,
+            },
+            ColumnRegion {
+                x_min: 537.0,
+                x_max: 576.0,
+            },
+        ];
+        let mut tick = make_item(1, 561.6, 300.0, "[x]");
+        tick.width = 7.1;
+        let items = vec![
+            make_item(1, 40.0, 627.6, "Is the partnership"),
+            tick.clone(),
+        ];
+
+        assert_eq!(answer_mark_column(&tick, &items, &columns), None);
     }
 
     #[test]

@@ -306,6 +306,15 @@ impl TextLine {
         let reverse_font_ratio = prev_item.font_size / item.font_size;
         let y_diff = (item.y - prev_item.y).abs();
 
+        // A checkbox token stands apart from its label even when its glyph
+        // is set smaller and higher, which would otherwise read as a
+        // superscript run.
+        if crate::text_utils::is_checkbox_mark(text)
+            || crate::text_utils::is_checkbox_mark(&prev_item.text)
+        {
+            return !(result.ends_with(' ') || text.starts_with(' '));
+        }
+
         let is_sub_super = font_ratio < 0.85 && y_diff > 1.0;
         let was_sub_super = reverse_font_ratio < 0.85 && y_diff > 1.0;
 
@@ -395,6 +404,48 @@ mod formatting_tests {
             line.text_with_formatting(true, true, true),
             "<s>deleted words</s>"
         );
+    }
+
+    #[test]
+    fn checkbox_token_is_spaced_from_its_label() {
+        // A flattened form's tick glyph is set smaller than the label and
+        // sits a little above its baseline, which reads like a superscript
+        // run. A checkbox is a word of its own, never a superscript.
+        let label = |text: &str, x: f32, width: f32| TextItem {
+            font_size: 8.0,
+            ..item(text, x, width, false)
+        };
+        let tick = TextItem {
+            y: 101.8,
+            font_size: 5.6,
+            ..item("[x]", 99.2, 4.7, false)
+        };
+        let line = line(vec![
+            label("Yes", 80.0, 13.0),
+            tick,
+            label("Single", 110.0, 24.0),
+        ]);
+
+        assert_eq!(line.text(), "Yes [x] Single");
+        assert_eq!(
+            line.text_with_formatting(true, true, true),
+            "Yes [x] Single"
+        );
+    }
+
+    #[test]
+    fn labelled_answer_mark_is_spaced_from_its_question() {
+        let mark = TextItem {
+            y: 101.8,
+            font_size: 5.6,
+            ..item("[x] No", 561.6, 7.1, false)
+        };
+        let line = line(vec![
+            item("Publicly traded? .....", 50.0, 480.0, false),
+            mark,
+        ]);
+
+        assert_eq!(line.text(), "Publicly traded? ..... [x] No");
     }
 
     #[test]
