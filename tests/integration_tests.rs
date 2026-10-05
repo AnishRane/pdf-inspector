@@ -4664,3 +4664,110 @@ fn fillable_form_values_sit_beside_their_labels() {
         );
     }
 }
+
+/// Three pages whose lines match except for a figure or a word that marks
+/// the page, as on monthly statements or near-identical copies of a form.
+fn make_near_identical_pages_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R] /Count 3 >>",
+    );
+    for (page_index, marker) in ["MARKER-ALPHA", "MARKER-BRAVO", "MARKER-CHARLIE"]
+        .iter()
+        .enumerate()
+    {
+        let page_id = 3 + page_index * 2;
+        let content_id = page_id + 1;
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            page_id,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 9 0 R >> >> /Contents {content_id} 0 R >>"
+            ),
+        );
+        let n = page_index + 1;
+        let lines = [
+            format!("Statement for account holder number {n}"),
+            format!("Opening balance carried forward {n}"),
+            format!("Closing balance for the period {n}"),
+            format!("{marker} reference line"),
+        ];
+        let mut content = String::from("BT /F1 12 Tf");
+        for (row, line) in lines.iter().enumerate() {
+            content.push_str(&format!(" 1 0 0 1 72 {} Tm ({line}) Tj", 700 - row * 20));
+        }
+        content.push_str(" ET");
+        add_object(
+            &mut pdf,
+            &mut offsets,
+            content_id,
+            &format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                content.len(),
+                content
+            ),
+        );
+    }
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        9,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn near_identical_pages_keep_their_own_content() {
+    let markdown = process_pdf_mem(&make_near_identical_pages_pdf())
+        .expect("convert near-identical pages")
+        .markdown
+        .expect("markdown output");
+
+    for marker in ["MARKER-ALPHA", "MARKER-BRAVO", "MARKER-CHARLIE"] {
+        assert!(
+            markdown.contains(marker),
+            "{marker} dropped from:\n{markdown}"
+        );
+    }
+    for n in 1..=3 {
+        assert!(
+            markdown.contains(&format!("Closing balance for the period {n}")),
+            "page {n}'s closing balance dropped from:\n{markdown}"
+        );
+    }
+}

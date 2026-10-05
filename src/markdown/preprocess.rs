@@ -553,6 +553,28 @@ pub(crate) fn strip_repeated_lines(lines: Vec<TextLine>, page_count: u32) -> Vec
         }
     }
 
+    // Running headers and footers are a small part of a page. When the
+    // "repeated" lines would be most of a page, they are its content: pages
+    // that repeat an earlier one with only figures changed (monthly
+    // statements, copies of a form) must keep their own lines. On such a
+    // page only lines identical to one on an earlier page go.
+    let mut page_lines: HashMap<u32, (usize, usize)> = HashMap::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let entry = page_lines.entry(line.page).or_default();
+        entry.0 += 1;
+        entry.1 += usize::from(removal_set.contains(&idx));
+    }
+    let mut first_page_exact: HashMap<String, u32> = HashMap::new();
+    for line in &lines {
+        let page = first_page_exact.entry(line.text()).or_insert(line.page);
+        *page = (*page).min(line.page);
+    }
+    removal_set.retain(|&idx| {
+        let line = &lines[idx];
+        let (total, removed) = page_lines[&line.page];
+        removed * 2 <= total || first_page_exact[&line.text()] < line.page
+    });
+
     if removal_set.is_empty() {
         return lines;
     }
@@ -677,6 +699,57 @@ mod tests {
         let heading_tiers = vec![18.0];
         let result = merge_heading_lines(lines, 12.0, &heading_tiers, None);
         assert_eq!(result.len(), 2, "should merge font-based heading lines");
+    }
+
+    #[test]
+    fn near_identical_pages_keep_their_lines() {
+        // Monthly statements: each page repeats the last one's lines with
+        // only its figures changed. Those lines are the page's content, not
+        // a running header, even though they repeat once figures are
+        // trimmed.
+        let mut lines = Vec::new();
+        for page in 1..=3u32 {
+            for (row, text) in [
+                "Statement for account holder number",
+                "Opening balance carried forward",
+                "Closing balance for the period",
+            ]
+            .iter()
+            .enumerate()
+            {
+                lines.push(make_line(
+                    &format!("{text} {page}"),
+                    12.0,
+                    page,
+                    700.0 - row as f32 * 20.0,
+                    None,
+                ));
+            }
+        }
+        let kept = strip_repeated_lines(lines, 3);
+        assert_eq!(kept.len(), 9);
+    }
+
+    #[test]
+    fn exact_copy_of_an_earlier_page_is_still_collapsed() {
+        let mut lines = Vec::new();
+        for page in 1..=3u32 {
+            for (row, text) in [
+                "Statement for account holder",
+                "Opening balance carried forward",
+                "Closing balance for the period",
+            ]
+            .iter()
+            .enumerate()
+            {
+                lines.push(make_line(text, 12.0, page, 700.0 - row as f32 * 20.0, None));
+            }
+        }
+        let kept = strip_repeated_lines(lines, 3);
+        assert!(
+            kept.iter().all(|line| line.page == 1),
+            "copies of page 1 collapse"
+        );
     }
 
     #[test]
