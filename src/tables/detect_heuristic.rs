@@ -570,6 +570,26 @@ pub(crate) fn detect_tables_with_page_width(
         .iter()
         .map(|item| script_index.is_script_attachment(item, base_font_size * 1.15))
         .collect();
+    // A smaller figure on the baseline of body text to its left belongs to
+    // that text's row: a form's line item prints its description in body
+    // text and has its amount filled in a smaller face. Taken for small
+    // print, such amounts form rows of a table above and fold into its last
+    // cell. Small labels stay candidates: a filled value set larger than the
+    // labels beside it does not make them part of its row.
+    let body_rows: Vec<(f32, f32)> = items
+        .iter()
+        .filter(|item| item.font_size > table_font_threshold && !item.text.trim().is_empty())
+        .map(|item| (item.y, item.x + item.width))
+        .collect();
+    let on_body_row = |item: &TextItem| {
+        let digits = item.text.chars().filter(char::is_ascii_digit).count();
+        let letters = item.text.chars().filter(|c| c.is_alphabetic()).count();
+        digits > 0
+            && letters <= 2
+            && body_rows
+                .iter()
+                .any(|&(y, right)| (y - item.y).abs() <= 1.5 && right <= item.x + 1.0)
+    };
     let table_candidates: Vec<(usize, &TextItem)> = items
         .iter()
         .enumerate()
@@ -577,6 +597,7 @@ pub(crate) fn detect_tables_with_page_width(
             expanded_evidence[*index]
                 && item.font_size <= table_font_threshold
                 && item.font_size >= 6.0
+                && !on_body_row(item)
         })
         .collect();
 
@@ -2152,6 +2173,65 @@ mod tests {
             is_strikeout: false,
             item_type: ItemType::Text,
             mcid: None,
+        }
+    }
+
+    #[test]
+    fn figures_on_body_text_rows_stay_out_of_a_small_print_table() {
+        // Form 1041: a small-print header grid (G(1), G(2) ...) sits above
+        // the line items. Each line item's description is body text and its
+        // amount is filled in a smaller face on the same baseline; one line
+        // has two amounts. The amounts belong to their lines, not to the
+        // header grid's last cell.
+        let mut items = Vec::new();
+        for (row, y) in [700.0, 688.0, 676.0, 664.0, 652.0, 640.0]
+            .into_iter()
+            .enumerate()
+        {
+            items.push(make_item(
+                &format!("Header label {row}"),
+                40.0,
+                y,
+                7.0,
+                90.0,
+            ));
+            items.push(make_item(&format!("Check box {row}"), 220.0, y, 7.0, 60.0));
+            items.push(make_item(&format!("Trust TIN {row}"), 420.0, y, 7.0, 50.0));
+        }
+        for (line, y) in [626.6, 614.6, 602.6, 590.6, 578.6].into_iter().enumerate() {
+            items.push(make_item(
+                &format!("{line} Interest income ........"),
+                60.0,
+                y,
+                9.0,
+                300.0,
+            ));
+            items.push(make_item(
+                &format!("{line},234,567"),
+                520.0,
+                y - 0.4,
+                8.0,
+                40.0,
+            ));
+            if line == 2 {
+                items.push(make_item("7,654,321", 380.0, y - 0.4, 8.0, 40.0));
+            }
+        }
+
+        let tables = detect_tables(&items, 9.0, false);
+        for row in tables.iter().flat_map(|table| &table.cells) {
+            for line in 0..5 {
+                if row
+                    .iter()
+                    .any(|cell| cell.contains(&format!("{line},234,567")))
+                {
+                    assert!(
+                        row.iter()
+                            .any(|cell| cell.contains(&format!("{line} Interest income"))),
+                        "amount of line {line} left its row: {row:?}"
+                    );
+                }
+            }
         }
     }
 

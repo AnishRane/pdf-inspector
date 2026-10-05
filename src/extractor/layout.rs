@@ -1794,6 +1794,14 @@ pub(crate) fn is_newspaper_layout(
         return false;
     }
 
+    // A column made almost entirely of figures (amounts, line numbers) whose
+    // lines sit on another column's baselines is the value column of a form
+    // or table, not a text flow of its own: read the page row by row so each
+    // figure stays with its line.
+    if (0..per_column_lines.len()).any(|ci| is_value_column(per_column_lines, ci)) {
+        return false;
+    }
+
     if min_lines < 15 {
         // Sidebar detection: a narrow annotation column beside a wide body column.
         // Guards:
@@ -1879,6 +1887,36 @@ pub(crate) fn is_newspaper_layout(
 
     let ratio = collisions as f32 / smallest.len() as f32;
     ratio > 0.5
+}
+
+/// Whether column `ci` holds the values of rows read in another column:
+/// at least 80% of its lines are figures, and at least 60% sit on a line of
+/// another column.
+fn is_value_column(per_column_lines: &[Vec<TextLine>], ci: usize) -> bool {
+    let column = &per_column_lines[ci];
+    if column.is_empty() {
+        return false;
+    }
+    // A figure: digits with at most two letters (a line number such as
+    // "12b"), plus the punctuation of amounts.
+    let is_figure = |line: &TextLine| {
+        let text = line.text();
+        let digits = text.chars().filter(char::is_ascii_digit).count();
+        let letters = text.chars().filter(|c| c.is_alphabetic()).count();
+        digits > 0 && letters <= 2
+    };
+    let figures = column.iter().filter(|line| is_figure(line)).count();
+    let aligned = column
+        .iter()
+        .filter(|line| {
+            per_column_lines
+                .iter()
+                .enumerate()
+                .filter(|&(other, _)| other != ci)
+                .any(|(_, lines)| lines.iter().any(|other| (other.y - line.y).abs() < 3.0))
+        })
+        .count();
+    figures * 5 >= column.len() * 4 && aligned * 5 >= column.len() * 3
 }
 
 /// Split column lines into a core cluster and stragglers.

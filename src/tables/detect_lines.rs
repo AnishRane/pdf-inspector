@@ -660,6 +660,73 @@ fn detect_text_anchor_rule_tables(
     tables
 }
 
+/// A strip past the outermost vertical counts as a column only when it is
+/// at least this wide.
+const MIN_OPEN_STRIP: f32 = 15.0;
+
+/// Close a grid whose outer columns end at the page's frame rather than a
+/// drawn rule. Tax forms rule every row across the full width, but the
+/// amount column's right side (and the line-number margin's left side) is
+/// the form's border, so the verticals stop one column short and the
+/// amounts fall outside the table, away from their rows. When three or more
+/// row rules run on past the outermost vertical to one common end, and text
+/// sits in that strip within their height, the strip becomes a column.
+fn close_open_sides(
+    mut edges: Vec<f32>,
+    horizontals: &[(f32, f32, f32)],
+    items: &[TextItem],
+    page: u32,
+) -> Vec<f32> {
+    let (Some(&first), Some(&last)) = (edges.first(), edges.last()) else {
+        return edges;
+    };
+    // The rules must run to one common end, as rules meeting a frame do;
+    // rules from separate tables end where their own tables do.
+    let common_end = |mut values: Vec<f32>| {
+        values.sort_by(f32::total_cmp);
+        let median = values[values.len() / 2];
+        let shared = values.iter().filter(|v| (*v - median).abs() <= 3.0).count();
+        (shared * 5 >= values.len() * 4).then_some(median)
+    };
+    let strip_has_text = |from: f32, to: f32, rules: &[&(f32, f32, f32)]| {
+        let low = rules.iter().map(|r| r.0).fold(f32::INFINITY, f32::min);
+        let high = rules.iter().map(|r| r.0).fold(f32::NEG_INFINITY, f32::max);
+        items.iter().any(|item| {
+            let centre = item.x + item.width / 2.0;
+            item.page == page
+                && centre > from
+                && centre < to
+                && item.y > low
+                && item.y < high
+                && !item.text.trim().is_empty()
+        })
+    };
+
+    let past_right: Vec<&(f32, f32, f32)> = horizontals
+        .iter()
+        .filter(|(_, x0, x1)| *x0 <= last + 3.0 && *x1 >= last + MIN_OPEN_STRIP)
+        .collect();
+    if past_right.len() >= 3 {
+        if let Some(end) = common_end(past_right.iter().map(|r| r.2).collect()) {
+            if strip_has_text(last, end, &past_right) {
+                edges.push(end);
+            }
+        }
+    }
+    let past_left: Vec<&(f32, f32, f32)> = horizontals
+        .iter()
+        .filter(|(_, x0, x1)| *x1 >= first - 3.0 && *x0 <= first - MIN_OPEN_STRIP)
+        .collect();
+    if past_left.len() >= 3 {
+        if let Some(start) = common_end(past_left.iter().map(|r| r.1).collect()) {
+            if strip_has_text(start, first, &past_left) {
+                edges.insert(0, start);
+            }
+        }
+    }
+    edges
+}
+
 fn line_overlaps_text_anchor_band(line: &PdfLine, table: &TextAnchorTable) -> bool {
     let line_x_min = line.x1.min(line.x2);
     let line_x_max = line.x1.max(line.x2);
@@ -1649,7 +1716,7 @@ fn detect_tables_from_lines_inner(
         c
     } else {
         let v_xs: Vec<f32> = verticals.iter().map(|(x, _, _)| *x).collect();
-        snap_edges(&v_xs, 3.0)
+        close_open_sides(snap_edges(&v_xs, 3.0), &horizontals, items, page)
     };
 
     log::debug!(
@@ -1913,6 +1980,47 @@ mod tests {
             x2: x,
             y2,
             page,
+        }
+    }
+
+    #[test]
+    fn row_rules_past_the_last_vertical_close_the_grid() {
+        // A tax form's line items: a description, a ruled line-number box
+        // (x 482–504) and the amount box, whose right side is the form's
+        // frame rather than a drawn rule. The row rules run on to the
+        // frame at x 576, and the amounts must stay on their rows.
+        // Row heights vary as on a real form (evenly spaced rules read as
+        // chart gridlines).
+        let rules = [700.0, 676.0, 648.0, 624.0, 596.0, 572.0];
+        let mut lines: Vec<PdfLine> = rules
+            .iter()
+            .map(|&y| make_hline(y, 36.0, 576.0, 1))
+            .collect();
+        for x in [122.4, 482.4, 504.0] {
+            lines.push(make_vline(x, 572.0, 700.0, 1));
+        }
+        let mut items = Vec::new();
+        for i in 0..5 {
+            let y = rules[i + 1] + 6.0;
+            let mut description = make_item(&format!("Line {i} description"), 130.0, y, 1);
+            description.width = 200.0;
+            items.push(description);
+            items.push(make_item(&format!("{i}"), 488.0, y, 1));
+            items.push(make_item(&format!("{i}0,000"), 540.0, y, 1));
+        }
+
+        let tables = detect_tables_from_lines(&items, &lines, 1);
+        assert_eq!(tables.len(), 1);
+        for i in 0..5 {
+            let row = tables[0]
+                .cells
+                .iter()
+                .find(|row| row.iter().any(|cell| cell.contains(&format!("Line {i} "))))
+                .expect("description row");
+            assert!(
+                row.iter().any(|cell| cell.contains(&format!("{i}0,000"))),
+                "amount left its row: {row:?}"
+            );
         }
     }
 

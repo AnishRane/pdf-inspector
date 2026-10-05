@@ -114,6 +114,15 @@ fn merge_box(items: &[TextItem], members: &[usize]) -> Option<TextItem> {
     if box_lines.len() < 2 || box_lines.len() > MAX_BOX_LINES {
         return None;
     }
+    // A field box opens with its printed label. A run of dot leaders on top
+    // means the "box" is a band of form rows between section rules.
+    let has_word = |line: &[TextItem]| {
+        line.iter()
+            .any(|item| item.text.chars().any(char::is_alphabetic))
+    };
+    if !has_word(&box_lines[0]) {
+        return None;
+    }
     // A form box's value is filled in a face or size of its own below the
     // printed label; lines all in one face are a table cell's wrapped text,
     // which table detection reads line by line.
@@ -552,6 +561,33 @@ mod tests {
             texts(&items),
             ["Account number (see instructions) IRA-000000"]
         );
+    }
+
+    #[test]
+    fn dot_leaders_and_a_lower_rows_figures_are_not_a_box() {
+        // Form 1041 lines 1–2b: between two section rules sit the dot
+        // leaders of lines 1 and 2a and the two figures of line 2b. They
+        // are rows of the form, not a field's label and value.
+        let lines = vec![
+            line(35.8, 570.0, 576.2, 570.0),
+            line(300.0, 530.0, 482.0, 530.0),
+            line(50.4, 570.2, 50.4, 449.6),
+            line(482.4, 570.2, 482.4, 529.8),
+        ];
+        let amount = |value: &str, x: f32| {
+            let mut item = text(value, x, 536.6, 30.0, 8.0);
+            item.font = "HelveticaLTStd-Bold".to_string();
+            item
+        };
+        let mut items = vec![
+            text("............ ............", 264.0, 560.6, 210.0, 9.0),
+            text("............. .............", 264.0, 548.6, 210.0, 9.0),
+            amount("1,234,567", 380.0),
+            amount("7,654,321", 440.0),
+        ];
+        merge_boxed_text(&mut items, &[], &lines);
+
+        assert_eq!(items.len(), 4);
     }
 
     #[test]

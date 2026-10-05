@@ -3114,6 +3114,76 @@ mod tests {
         assert!(!is_newspaper_layout(&[col1, col2], &cols));
     }
 
+    #[test]
+    fn form_value_columns_beside_line_items_read_as_rows() {
+        // Form 1041 Schedule B: a wide column of line descriptions, a narrow
+        // column of line numbers and one of amounts, all on the descriptions'
+        // baselines. The figures are the rows' values, not text flows of
+        // their own to read after every description.
+        let make_line = |text: &str, y: f32, x: f32, width: f32| TextLine {
+            y,
+            page: 1,
+            adaptive_threshold: 0.10,
+            items: vec![TextItem {
+                text: text.into(),
+                x,
+                y,
+                width,
+                height: 9.0,
+                font: "F1".into(),
+                font_size: 9.0,
+                page: 1,
+                is_bold: false,
+                is_italic: false,
+                is_underline: false,
+                is_strikeout: false,
+                item_type: ItemType::Text,
+                mcid: None,
+            }],
+        };
+        let rows: Vec<f32> = (0..40).map(|i| 700.0 - i as f32 * 12.0).collect();
+        let descriptions: Vec<TextLine> = rows
+            .iter()
+            .map(|&y| {
+                make_line(
+                    "Adjusted total income. See instructions ....",
+                    y,
+                    50.0,
+                    420.0,
+                )
+            })
+            .collect();
+        let numbers: Vec<TextLine> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, &y)| make_line(&format!("{}", i + 1), y, 490.0, 9.0))
+            .collect();
+        let amounts: Vec<TextLine> = rows
+            .iter()
+            .step_by(2)
+            .map(|&y| make_line("1,234,567", y, 535.0, 39.0))
+            .collect();
+        let cols = vec![
+            ColumnRegion {
+                x_min: 40.0,
+                x_max: 480.0,
+            },
+            ColumnRegion {
+                x_min: 480.0,
+                x_max: 520.0,
+            },
+            ColumnRegion {
+                x_min: 520.0,
+                x_max: 576.0,
+            },
+        ];
+
+        assert!(!is_newspaper_layout(
+            &[descriptions, numbers, amounts],
+            &cols
+        ));
+    }
+
     fn make_item_fs(text: &str, x: f32, y: f32, width: f32, font_size: f32) -> TextItem {
         TextItem {
             text: text.into(),
