@@ -3,6 +3,7 @@
 //! This module extracts text with position information for structure detection.
 
 mod base14;
+mod boxes;
 mod checkboxes;
 mod content_decode;
 pub(crate) mod content_stream;
@@ -424,6 +425,7 @@ fn extract_positioned_text_impl(
         } else {
             links::place_form_items(&mut items, form_items);
             checkboxes::attach_checkbox_labels(&mut items);
+            boxes::merge_boxed_text(&mut items, &rects, &lines);
         }
         all_items.extend(items);
         all_rects.extend(rects);

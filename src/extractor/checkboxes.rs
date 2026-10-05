@@ -11,11 +11,67 @@ use crate::types::TextItem;
 const ROW_TOLERANCE: f32 = 3.0;
 
 /// Give each checkbox token on one page its label, so later layout keeps the
-/// two together: the option word just right of the box, or else the Yes/No
-/// header of the answer column the box sits in.
+/// two together: the option word just right of the box, else the Yes/No
+/// header of the answer column the box sits in, else the label printed just
+/// above a box that stands alone on its row.
 pub(crate) fn attach_checkbox_labels(items: &mut Vec<TextItem>) {
     join_inline_labels(items);
     label_answer_column_checkboxes(items);
+    join_labels_above(items);
+}
+
+/// A box set just under its label, alone on its row ("Check here if
+/// retired" over its box), joins the end of that label. Left alone, it is
+/// read with whatever else shares its height, often another field's entry.
+fn join_labels_above(items: &mut Vec<TextItem>) {
+    let mut joins = Vec::new();
+    for (index, mark) in items.iter().enumerate() {
+        if !is_checkbox_token(&mark.text) {
+            continue;
+        }
+        // Anything leading up to the box on its own row (a question, its
+        // dot leaders) makes the row the box's context.
+        let led_up_to = items.iter().any(|item| {
+            (item.y - mark.y).abs() <= ROW_TOLERANCE
+                && item.x + item.width <= mark.x + 1.0
+                && mark.x - (item.x + item.width) <= 72.0
+                && !is_checkbox_mark(&item.text)
+        });
+        if led_up_to {
+            continue;
+        }
+        let reach = mark.font_size.max(8.0) * 2.5;
+        let label = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.y > mark.y + ROW_TOLERANCE
+                    && item.y - mark.y <= reach
+                    && item.x <= mark.x
+                    && item.x + item.width >= mark.x + mark.width
+                    && is_word(&item.text)
+            })
+            .min_by(|(_, a), (_, b)| a.y.total_cmp(&b.y))
+            .map(|(label, _)| label);
+        if let Some(label) = label {
+            joins.push((index, label));
+        }
+    }
+    if joins.is_empty() {
+        return;
+    }
+    let mut remove = vec![false; items.len()];
+    for (mark, label) in joins {
+        let mark_text = items[mark].text.trim().to_string();
+        let joined = format!("{} {mark_text}", items[label].text.trim_end());
+        items[label].text = joined;
+        remove[mark] = true;
+    }
+    let mut index = 0;
+    items.retain(|_| {
+        index += 1;
+        !remove[index - 1]
+    });
 }
 
 /// Forms set a box just left of its option label ("[x] Single",
@@ -232,6 +288,37 @@ mod tests {
                 "[x] Limited partner or other LLC"
             ]
         );
+    }
+
+    #[test]
+    fn box_under_its_label_joins_that_label() {
+        // Form 706 line 2b: the box sits just under "Check here if retired",
+        // level with the neighbouring box's entry far to the left.
+        let mut items = vec![
+            item("Check here if retired", 489.5, 566.3, 72.5),
+            item("Investor and philanthropist", 66.8, 554.2, 103.1),
+            item("[x]", 521.0, 557.1, 4.8),
+        ];
+        attach_checkbox_labels(&mut items);
+        let texts: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["Check here if retired [x]", "Investor and philanthropist"]
+        );
+    }
+
+    #[test]
+    fn answer_after_its_question_on_the_row_stays_put() {
+        // "... checked ..... [x]": the question leads up to the box on its
+        // own row, so the line above is not its label.
+        let mut items = vec![
+            item("Schedule K-3 is attached if", 472.0, 616.0, 86.5),
+            item("checked .", 472.0, 606.0, 33.9),
+            item(".", 552.0, 606.0, 1.9),
+            item("[x]", 563.6, 605.3, 4.9),
+        ];
+        attach_checkbox_labels(&mut items);
+        assert_eq!(items[3].text, "[x]");
     }
 
     #[test]
