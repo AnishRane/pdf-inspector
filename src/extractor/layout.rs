@@ -173,6 +173,9 @@ pub(crate) fn detect_columns(
     let wide_threshold = page_width * 0.6;
     let num_bins = ((page_width / bin_width).ceil() as usize).clamp(1, MAX_BINS);
     let mut histogram = vec![0u32; num_bins];
+    // The lone punctuation marks among those counts, so a gutter that a
+    // stray mark splits can be rejoined below.
+    let mut marks = vec![0u32; num_bins];
 
     for item in &page_items {
         let w = effective_width(item);
@@ -185,6 +188,11 @@ pub(crate) fn detect_columns(
         let right = right.min(num_bins);
         for count in histogram.iter_mut().take(right).skip(left) {
             *count += 1;
+        }
+        if is_lone_punctuation(&item.text) {
+            for count in marks.iter_mut().take(right).skip(left) {
+                *count += 1;
+            }
         }
     }
 
@@ -211,6 +219,14 @@ pub(crate) fn detect_columns(
     if let Some(start) = valley_start {
         valleys.push((start, num_bins));
     }
+    let valleys = rejoin_split_gutters(
+        valleys,
+        &histogram,
+        &marks,
+        noise_threshold,
+        bin_width,
+        MIN_GUTTER_WIDTH,
+    );
 
     // Filter valleys: must be wide enough and not at page margins
     let margin_threshold = page_width * 0.05;
@@ -736,6 +752,52 @@ fn find_relative_valleys(
     }
 
     valleys
+}
+
+/// A single ASCII punctuation mark on its own, such as a printed "(" or a
+/// stray ".".
+fn is_lone_punctuation(text: &str) -> bool {
+    let mut chars = text.trim().chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if c.is_ascii_punctuation())
+}
+
+/// Rejoin a gutter that stray punctuation split in two.
+///
+/// A printed parenthesis or a lone period inside a gutter lifts a few bins
+/// just over the noise floor, leaving two empty runs that are each too narrow
+/// to count. Two such runs join when the bins between them, also narrower
+/// than a gutter, are empty once their lone punctuation marks are discounted
+/// and hold no more marks than the noise allowance (a dot on every line is a
+/// leader column, not a stray). Runs already wide enough are left alone, so a
+/// gutter found without this keeps its edges.
+fn rejoin_split_gutters(
+    runs: Vec<(usize, usize)>,
+    histogram: &[u32],
+    marks: &[u32],
+    noise_threshold: u32,
+    bin_width: f32,
+    min_gutter_width: f32,
+) -> Vec<(usize, usize)> {
+    let narrow = |start: usize, end: usize| (end - start) as f32 * bin_width < min_gutter_width;
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for run in runs {
+        if let Some(last) = joined.last_mut() {
+            let strays_only = (last.1..run.0).all(|b| {
+                marks[b] <= noise_threshold
+                    && histogram[b].saturating_sub(marks[b]) <= noise_threshold
+            });
+            if narrow(last.0, last.1)
+                && narrow(run.0, run.1)
+                && narrow(last.1, run.0)
+                && strays_only
+            {
+                last.1 = run.1;
+                continue;
+            }
+        }
+        joined.push(run);
+    }
+    joined
 }
 
 /// Detect whether a side of a gutter consists predominantly of list-marker
@@ -2713,6 +2775,64 @@ mod tests {
         }
         let cols = detect_columns(&items, 1, false);
         assert!(cols.len() <= 1, "expected one column, got {cols:?}");
+    }
+
+    /// A text column and an amount column 14pt apart, with five header runs
+    /// crossing the gutter (exactly the noise allowance) and `bump` glyphs in
+    /// the middle of it at x=196.
+    fn gutter_page(bump: &[&str]) -> Vec<TextItem> {
+        let mut items = Vec::new();
+        for row in 0..30 {
+            let y = 700.0 - row as f32 * 14.0;
+            let mut text = make_item(1, 40.0, y, "Line text");
+            text.width = 150.0;
+            let mut amount = make_item(1, 204.0, y, "1,234");
+            amount.width = 100.0;
+            items.extend([text, amount]);
+        }
+        for row in 0..5 {
+            let mut header = make_item(1, 120.0, 800.0 - row as f32 * 14.0, "Header");
+            header.width = 140.0;
+            items.push(header);
+        }
+        for (i, text) in bump.iter().enumerate() {
+            let mut glyph = make_item(1, 196.0, 650.0 - i as f32 * 14.0, text);
+            glyph.width = 3.0;
+            items.push(glyph);
+        }
+        items
+    }
+
+    #[test]
+    fn stray_parentheses_do_not_split_a_gutter() {
+        // Schedule E prints "(" before the amount on loss lines, inside the
+        // gutter between the line text and the amounts. With the gutter
+        // already crossed up to the noise allowance, two of them split it
+        // into two pieces each too narrow to count, and the page read as one
+        // column.
+        assert_eq!(detect_columns(&gutter_page(&[]), 1, true).len(), 2);
+        let cols = detect_columns(&gutter_page(&["(", "("]), 1, true);
+        assert_eq!(cols.len(), 2, "expected the gutter kept, got {cols:?}");
+        assert!(
+            (190.0..=204.0).contains(&cols[0].x_max),
+            "gutter at {}, expected inside 190..204",
+            cols[0].x_max
+        );
+    }
+
+    #[test]
+    fn letters_between_gutter_pieces_keep_them_apart() {
+        // Superscripts in a sparse math page sit in the same kind of narrow
+        // gap. They are text, so the gap is not a gutter.
+        let cols = detect_columns(&gutter_page(&["p", "p"]), 1, true);
+        assert_eq!(cols.len(), 1, "expected one column, got {cols:?}");
+    }
+
+    #[test]
+    fn column_of_dots_between_gutter_pieces_keeps_them_apart() {
+        // A dot on every line is a dot-leader column, not a stray mark.
+        let cols = detect_columns(&gutter_page(&["."; 20]), 1, true);
+        assert_eq!(cols.len(), 1, "expected one column, got {cols:?}");
     }
 
     #[test]
