@@ -4654,12 +4654,10 @@ fn fillable_form_values_sit_beside_their_labels() {
     assert!(markdown.contains("[x] Single"), "{markdown}");
     assert!(markdown.contains("[ ] Head of household"), "{markdown}");
 
-    for absent in [
-        "topmostSubform",
-        "f1_14",
-        "Read-only mirror",
-        "Hidden value",
-    ] {
+    // A read-only field still shows its value on the page; a hidden one
+    // does not.
+    assert!(markdown.contains("Read-only mirror"), "{markdown}");
+    for absent in ["topmostSubform", "f1_14", "Hidden value"] {
         assert!(
             !markdown.contains(absent),
             "{absent:?} leaked into:\n{markdown}"

@@ -163,8 +163,9 @@ pub(crate) fn extract_link_uri(doc: &Document, annot_dict: &lopdf::Dictionary) -
 /// Extract form field values from AcroForm dictionary.
 ///
 /// Each visible widget yields its value laid out inside the widget's
-/// `/Rect`, as a viewer would draw it: a text field's value (one item per
-/// line), or `[x]` / `[ ]` for a checkbox or radio button. Empty, read-only,
+/// `/Rect`, as a viewer would draw it: a text field's value (a multiline one
+/// joined into one run), or `[x]` / `[ ]` for a checkbox or radio button.
+/// Read-only fields count, since they still show their values; empty,
 /// hidden, password, push-button and signature fields yield nothing. Field
 /// names such as `topmostSubform[0].Page1[0].f1_14[0]` are internal plumbing
 /// and never reach the text; `RUST_LOG=pdf_inspector::extractor::links=debug`
@@ -250,8 +251,7 @@ pub(crate) struct Inherited<'a> {
     value: Option<&'a Object>,
 }
 
-// Field flags (`/Ff`, ISO 32000-1 tables 221, 226 and 228).
-const FF_READ_ONLY: i64 = 1;
+// Field flags (`/Ff`, ISO 32000-1 tables 226 and 228).
 const FF_MULTILINE: i64 = 1 << 12;
 const FF_PASSWORD: i64 = 1 << 13;
 const FF_PUSHBUTTON: i64 = 1 << 16;
@@ -379,7 +379,9 @@ pub(crate) fn walk_form_fields<'a>(
     };
     let flags = inherited.flags;
     let annotation_flags = integer(b"F").unwrap_or(0);
-    if flags & FF_READ_ONLY != 0 || annotation_flags & F_NOT_SHOWN != 0 {
+    // Read-only fields still show their values (a form locked after
+    // signing marks every field read-only); hidden ones do not.
+    if annotation_flags & F_NOT_SHOWN != 0 {
         return;
     }
 
@@ -1057,7 +1059,22 @@ mod tests {
     }
 
     #[test]
-    fn read_only_hidden_password_and_empty_fields_emit_nothing() {
+    fn read_only_field_keeps_its_value() {
+        // A form locked after signing marks every field read-only; the
+        // values still show on the page, and must still be read.
+        let (doc, page_map) = form_doc(vec![dictionary! {
+            "FT" => "Tx",
+            "Ff" => 1,
+            "T" => Object::string_literal("name"),
+            "V" => Object::string_literal("Celeste W"),
+            "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
+        }]);
+
+        assert_eq!(texts(&extract_form_fields(&doc, &page_map)), ["Celeste W"]);
+    }
+
+    #[test]
+    fn hidden_password_and_empty_fields_emit_nothing() {
         let tx = |name: &str, value: &str| {
             dictionary! {
                 "FT" => "Tx",
@@ -1066,8 +1083,6 @@ mod tests {
                 "Rect" => vec![10.into(), 20.into(), 110.into(), 40.into()],
             }
         };
-        let mut read_only = tx("copy", "mirror");
-        read_only.set("Ff", 1);
         let mut hidden = tx("hidden", "secret");
         hidden.set("F", 2);
         let mut no_view = tx("noview", "secret");
@@ -1075,7 +1090,6 @@ mod tests {
         let mut password = tx("pin", "1234");
         password.set("Ff", 1 << 13);
         let (doc, page_map) = form_doc(vec![
-            read_only,
             hidden,
             no_view,
             password,
