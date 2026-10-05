@@ -42,24 +42,26 @@ pub(crate) fn merge_boxed_text(items: &mut Vec<TextItem>, rects: &[PdfRect], lin
     if rules.horizontal.is_empty() || rules.vertical.is_empty() {
         return;
     }
-    let mut boxes: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+    let mut boxes: HashMap<(i32, i32, i32), (Vec<usize>, bool)> = HashMap::new();
     for (index, item) in items.iter().enumerate() {
         if !matches!(item.item_type, ItemType::Text) || item.text.trim().is_empty() {
             continue;
         }
-        if let Some(walls) = rules.walls(item) {
-            boxes.entry(walls).or_default().push(index);
+        if let Some((walls, edge_closed)) = rules.walls(item) {
+            let entry = boxes.entry(walls).or_default();
+            entry.0.push(index);
+            entry.1 |= edge_closed;
         }
     }
 
     let mut merged: Vec<(usize, TextItem)> = Vec::new();
     let mut remove = vec![false; items.len()];
-    for ((top, bottom, _), members) in boxes {
+    for ((top, bottom, _), (members, edge_closed)) in boxes {
         let height = (top - bottom) as f32 / 2.0;
         if members.len() < 2 || height > MAX_TALL_BOX_HEIGHT {
             continue;
         }
-        let Some(item) = merge_box(items, &members, height) else {
+        let Some(item) = merge_box(items, &members, height, edge_closed) else {
             continue;
         };
         let first = *members.iter().min().expect("box has members");
@@ -89,7 +91,12 @@ pub(crate) fn merge_boxed_text(items: &mut Vec<TextItem>, rects: &[PdfRect], lin
 /// One item holding a box's text, line by line from the top, at its first
 /// line's baseline. `None` when the text sits on a single line (nothing to
 /// keep together) or does not read as a form box's label and value.
-fn merge_box(items: &[TextItem], members: &[usize], height: f32) -> Option<TextItem> {
+fn merge_box(
+    items: &[TextItem],
+    members: &[usize],
+    height: f32,
+    edge_closed: bool,
+) -> Option<TextItem> {
     let mut parts: Vec<&TextItem> = members.iter().map(|&index| &items[index]).collect();
     parts.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
     // Items share a line when their glyphs overlap vertically, so a raised
@@ -139,6 +146,24 @@ fn merge_box(items: &[TextItem], members: &[usize], height: f32) -> Option<TextI
     };
     let faces: Vec<(String, i32)> = box_lines.iter().map(|line| face(line)).collect();
     let value_start = faces.iter().position(|f| *f != faces[0])?;
+    // A box closed by the form's edge rather than a drawn side must hold a
+    // value filled in a font its printed label does not use: a size or
+    // weight change within the label's own fonts there is a table's column
+    // header wrapping over two lines.
+    if edge_closed {
+        let label_fonts: std::collections::HashSet<&str> = box_lines[..value_start]
+            .iter()
+            .flatten()
+            .map(|item| item.font.as_str())
+            .collect();
+        if box_lines[value_start..]
+            .iter()
+            .flatten()
+            .any(|item| label_fonts.contains(item.font.as_str()))
+        {
+            return None;
+        }
+    }
     // A taller box must read as a label block over a value block: each in
     // one face, the label set no larger than the value. A bordered callout's
     // heading is set larger than its body, and alternating faces are a list
@@ -206,11 +231,17 @@ fn main_run(line: &[TextItem]) -> &TextItem {
         .expect("a line has a full-size run")
 }
 
+/// An axis-aligned rule: `(position, start, end)`.
+type Rule = (f32, f32, f32);
+
 /// A page's axis-aligned rules: stroked lines and rects thin enough to be
 /// lines.
 struct Rules {
     /// `(y, x_start, x_end)`
     horizontal: Vec<(f32, f32, f32)>,
+    /// The horizontal rules with pieces drawn along one line joined, for
+    /// reading where a rule truly ends.
+    joined_horizontal: Vec<Rule>,
     /// `(x, y_start, y_end)`
     vertical: Vec<(f32, f32, f32)>,
 }
@@ -244,57 +275,143 @@ impl Rules {
             }
         }
         Self {
+            joined_horizontal: join_collinear(horizontal.clone()),
             horizontal,
             vertical,
         }
     }
 
     /// The nearest rules above and below an item's glyphs that span its
-    /// middle: the field row it sits in.
-    fn band(&self, item: &TextItem) -> Option<(f32, f32)> {
+    /// middle, as `(y, x_start, x_end)`: the field row it sits in.
+    fn band_rules(&self, item: &TextItem) -> Option<(Rule, Rule)> {
         let size = item.font_size.max(1.0);
         let (glyph_top, glyph_bottom) = (item.y + size * 0.7, item.y - size * 0.25);
         let mid_x = item.x + item.width / 2.0;
-        let rows = || {
+        let spanning = || {
             self.horizontal
                 .iter()
                 .filter(|&&(_, x0, x1)| x0 - RULE_SLACK <= mid_x && mid_x <= x1 + RULE_SLACK)
-                .map(|&(y, _, _)| y)
+                .copied()
         };
-        let top = rows().filter(|&y| y >= glyph_top - 0.5).reduce(f32::min)?;
-        let bottom = rows()
-            .filter(|&y| y <= glyph_bottom + 0.5)
-            .reduce(f32::max)?;
+        let top = spanning()
+            .filter(|rule| rule.0 >= glyph_top - 0.5)
+            .min_by(|a, b| a.0.total_cmp(&b.0))?;
+        let bottom = spanning()
+            .filter(|rule| rule.0 <= glyph_bottom + 0.5)
+            .max_by(|a, b| a.0.total_cmp(&b.0))?;
         Some((top, bottom))
+    }
+
+    /// The `(top, bottom)` heights of [`Rules::band_rules`].
+    fn band(&self, item: &TextItem) -> Option<(f32, f32)> {
+        self.band_rules(item).map(|(top, bottom)| (top.0, bottom.0))
     }
 
     /// The rules closing in an item: the nearest one above and below its
     /// glyphs and to its left and right, as `(top, bottom, left)` in
-    /// half-points. The right wall must exist but is not part of the box's
+    /// half-points, and whether a side came from the form's edge. The right wall must exist but is not part of the box's
     /// identity: a sub-box ruled into one corner of a field box stands
     /// between the label and the box's own right edge, but not beside the
     /// value.
-    fn walls(&self, item: &TextItem) -> Option<(i32, i32, i32)> {
-        let (top, bottom) = self.band(item)?;
+    ///
+    /// A box at the form's edge has no side drawn there (the page frame
+    /// closes it). Its top and bottom rules then start (or end) together at
+    /// that edge and both run to the box's drawn side opposite, a vertical
+    /// crossing the whole band: that common end serves as the missing side.
+    /// Rules across the form with no drawn side between them bound a band
+    /// of rows, not a box.
+    fn walls(&self, item: &TextItem) -> Option<((i32, i32, i32), bool)> {
+        let (top, bottom) = self.band_rules(item)?;
+        let right_edge = item.x + item.width;
+        // Where the band's rules truly end, a rule drawn in pieces read whole.
+        let whole = |rule: Rule| {
+            self.joined_horizontal
+                .iter()
+                .find(|joined| {
+                    (joined.0 - rule.0).abs() <= 0.5
+                        && joined.1 <= rule.1 + 0.5
+                        && joined.2 >= rule.2 - 0.5
+                })
+                .copied()
+                .unwrap_or(rule)
+        };
+        let (top_whole, bottom_whole) = (whole(top), whole(bottom));
+        let crosses_band =
+            |&&(_, y0, y1): &&Rule| y0 <= bottom.0 + RULE_SLACK && y1 >= top.0 - RULE_SLACK;
+        let drawn_right = self
+            .vertical
+            .iter()
+            .filter(crosses_band)
+            .map(|&(x, _, _)| x)
+            .filter(|&x| x >= right_edge - 1.0)
+            .reduce(f32::min);
+        let drawn_left = self
+            .vertical
+            .iter()
+            .filter(crosses_band)
+            .map(|&(x, _, _)| x)
+            .filter(|&x| x <= item.x + 1.0)
+            .reduce(f32::max);
+        let (top, bottom) = (top_whole, bottom_whole);
+        let rules_start = drawn_right
+            .filter(|&side| {
+                (top.1 - bottom.1).abs() <= 2.0
+                    && top.2 >= side - RULE_SLACK
+                    && bottom.2 >= side - RULE_SLACK
+            })
+            .map(|_| top.1.min(bottom.1));
+        let rules_end = drawn_left
+            .filter(|&side| {
+                (top.2 - bottom.2).abs() <= 2.0
+                    && top.1 <= side + RULE_SLACK
+                    && bottom.1 <= side + RULE_SLACK
+            })
+            .map(|_| top.2.max(bottom.2));
         let mid_y = item.y + item.font_size.max(1.0) * 0.3;
-        let spans_y =
-            |&&(_, y0, y1): &&(f32, f32, f32)| y0 - RULE_SLACK <= mid_y && mid_y <= y1 + RULE_SLACK;
-        let left = self
+        let spans_y = |&&(_, y0, y1): &&Rule| y0 - RULE_SLACK <= mid_y && mid_y <= y1 + RULE_SLACK;
+        let drawn_side = self
             .vertical
             .iter()
             .filter(spans_y)
             .map(|&(x, _, _)| x)
             .filter(|&x| x <= item.x + 1.0)
-            .reduce(f32::max)?;
-        let right_edge = item.x + item.width;
-        self.vertical
+            .reduce(f32::max);
+        let edge_side = rules_start.filter(|&x| x <= item.x + 1.0);
+        // The form's edge stands in only where no side is drawn.
+        let left = drawn_side.or(edge_side)?;
+        let drawn_right = self
+            .vertical
             .iter()
             .filter(spans_y)
-            .any(|&(x, _, _)| x >= right_edge - 1.0)
-            .then_some(())?;
+            .any(|&(x, _, _)| x >= right_edge - 1.0);
+        let edge_right = rules_end.is_some_and(|x| x >= right_edge - 1.0);
+        (drawn_right || edge_right).then_some(())?;
+        // Whether a side came from the form's edge rather than a drawn rule.
+        let edge_closed = drawn_side.is_none() || !drawn_right;
+        let (top, bottom) = (top.0, bottom.0);
         let half_points = |v: f32| (v * 2.0).round() as i32;
-        Some((half_points(top), half_points(bottom), half_points(left)))
+        Some((
+            (half_points(top), half_points(bottom), half_points(left)),
+            edge_closed,
+        ))
     }
+}
+
+/// Join rules drawn in touching or overlapping pieces along one line, so a
+/// rule reads with its true ends. Forms often stroke one rule as several
+/// segments.
+fn join_collinear(mut rules: Vec<Rule>) -> Vec<Rule> {
+    rules.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let mut joined: Vec<Rule> = Vec::with_capacity(rules.len());
+    for rule in rules {
+        match joined.last_mut() {
+            Some(last) if (rule.0 - last.0).abs() <= 0.5 && rule.1 <= last.2 + RULE_SLACK => {
+                last.2 = last.2.max(rule.2);
+            }
+            _ => joined.push(rule),
+        }
+    }
+    joined
 }
 
 /// A comb's characters sit at most this many ems apart; a calendar's or a
@@ -765,6 +882,164 @@ mod tests {
         merge_boxed_text(&mut items, &[], &tall_box());
 
         assert_eq!(items.len(), 5);
+    }
+
+    #[test]
+    fn edge_boxes_closed_by_their_rules_ends_read_together() {
+        // The 1040's name row: three boxes between rules at y=708 and
+        // y=684. The form's own edges close the first box on the left and
+        // the SSN box on the right, so no vertical is drawn there; the box's
+        // top and bottom rules end together at its side instead. Unmerged,
+        // the first name drifted to the end of the row, after the SSN label.
+        let lines = vec![
+            line(35.8, 708.0, 252.2, 708.0),
+            line(251.8, 708.0, 468.2, 708.0),
+            line(467.8, 708.0, 576.2, 708.0),
+            line(35.8, 684.0, 252.2, 684.0),
+            line(251.8, 684.0, 468.2, 684.0),
+            line(467.8, 684.0, 576.2, 684.0),
+            line(252.0, 708.4, 252.0, 683.8),
+            line(468.0, 708.4, 468.0, 683.8),
+            line(500.7, 694.0, 500.7, 684.0),
+            line(522.4, 694.0, 522.4, 684.0),
+        ];
+        let value = |content: &str, x: f32, width: f32| {
+            let mut item = text(content, x, 687.2, width, 8.0);
+            item.font = "HelveticaLTStd-Bold".to_string();
+            item
+        };
+        let mut items = vec![
+            text(
+                "Your first name and middle initial",
+                36.0,
+                700.0,
+                104.5,
+                7.0,
+            ),
+            text("Last name", 255.0, 700.0, 35.6, 7.0),
+            text("Your social security number", 472.0, 700.0, 95.5, 7.0),
+            value("Jane Q", 38.0, 36.9),
+            value("Doe", 256.0, 20.0),
+            value("000000000", 472.7, 99.6),
+        ];
+        merge_boxed_text(&mut items, &[], &lines);
+
+        assert_eq!(
+            texts(&items),
+            [
+                "Your first name and middle initial Jane Q",
+                "Last name Doe",
+                "Your social security number 000000000",
+            ]
+        );
+    }
+
+    #[test]
+    fn rule_drawn_in_pieces_reads_as_one_rule() {
+        // Form 706 line 1a: the box's bottom rule is drawn in three touching
+        // pieces under one full-width top rule. Joined, its ends meet the
+        // top rule's at the form's edge, and the box closes there.
+        let lines = vec![
+            line(35.8, 684.0, 576.2, 684.0),
+            line(35.8, 660.0, 50.7, 660.0),
+            line(50.2, 660.0, 65.1, 660.0),
+            line(64.6, 660.0, 288.2, 660.0),
+            line(288.0, 684.3, 288.0, 659.8),
+        ];
+        let mut value = text("Jane Q.", 66.8, 663.2, 42.2, 8.0);
+        value.font = "HelveticaLTStd-Bold".to_string();
+        let mut items = vec![
+            text("1a", 46.5, 676.0, 7.9, 7.0),
+            text(
+                "Decedent's first name and middle initial",
+                64.8,
+                676.0,
+                205.8,
+                7.0,
+            ),
+            value,
+        ];
+        merge_boxed_text(&mut items, &[], &lines);
+
+        assert_eq!(
+            texts(&items),
+            ["1a Decedent's first name and middle initial Jane Q."]
+        );
+    }
+
+    #[test]
+    fn band_between_full_width_rules_is_not_a_box() {
+        // Two rules across the whole form with no drawn side between them:
+        // a band of form rows, not a field box, however its ends line up.
+        let lines = vec![
+            line(35.8, 700.0, 576.2, 700.0),
+            line(35.8, 660.0, 576.2, 660.0),
+            // A ruled box elsewhere on the page.
+            line(300.0, 400.0, 300.0, 500.0),
+        ];
+        let mut amount = text("12,345", 520.0, 666.0, 30.0, 8.0);
+        amount.font = "HelveticaLTStd-Bold".to_string();
+        let mut items = vec![
+            text(
+                "Other income. List type and amount",
+                40.0,
+                688.0,
+                150.0,
+                9.0,
+            ),
+            amount,
+        ];
+        merge_boxed_text(&mut items, &[], &lines);
+
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn header_cell_in_the_labels_own_fonts_is_not_a_filled_box() {
+        // Schedule E's last column header: "(f) Other income from" over
+        // "Schedule K-1", set in the form's printed fonts with only the size
+        // varying. A filled value is set in a font the label does not use.
+        let lines = vec![
+            line(400.0, 620.0, 576.2, 620.0),
+            line(400.0, 596.0, 576.2, 596.0),
+            line(400.0, 620.3, 400.0, 595.8),
+        ];
+        let mut number = text("(f)", 404.0, 610.0, 8.0, 7.0);
+        number.font = "T1_1".to_string();
+        let mut first = text("Other income from", 414.0, 610.0, 60.0, 7.0);
+        first.font = "T1_0".to_string();
+        let mut second = text("Schedule K-1", 404.0, 601.0, 40.0, 6.5);
+        second.font = "T1_0".to_string();
+        let mut items = vec![number, first, second];
+        merge_boxed_text(&mut items, &[], &lines);
+
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn rules_ending_apart_leave_a_side_open() {
+        // A label between rules that end at different points has no side
+        // there; it stays unmerged.
+        let lines = vec![
+            line(35.8, 708.0, 252.2, 708.0),
+            line(80.0, 684.0, 252.2, 684.0),
+            line(252.0, 708.4, 252.0, 683.8),
+        ];
+        let mut value = text("Jane Q", 38.0, 687.2, 36.9, 8.0);
+        value.font = "HelveticaLTStd-Bold".to_string();
+        let mut items = vec![
+            text(
+                "Your first name and middle initial",
+                36.0,
+                700.0,
+                104.5,
+                7.0,
+            ),
+            value,
+        ];
+        merge_boxed_text(&mut items, &[], &lines);
+
+        assert_eq!(items.len(), 2);
     }
 
     #[test]
