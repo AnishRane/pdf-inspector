@@ -1794,7 +1794,7 @@ pub(crate) fn is_newspaper_layout(
         return false;
     }
 
-    // A column made almost entirely of figures (amounts, line numbers) whose
+    // A column made mostly of figures (amounts, line numbers) whose
     // lines sit on another column's baselines is the value column of a form
     // or table, not a text flow of its own: read the page row by row so each
     // figure stays with its line.
@@ -1890,7 +1890,8 @@ pub(crate) fn is_newspaper_layout(
 }
 
 /// Whether column `ci` holds the values of rows read in another column:
-/// at least 80% of its lines are figures, and at least 60% sit on a line of
+/// at least 70% of its lines are figures (the rest being the form's labels
+/// and headers that share the strip), and at least 60% sit on a line of
 /// another column.
 fn is_value_column(per_column_lines: &[Vec<TextLine>], ci: usize) -> bool {
     let column = &per_column_lines[ci];
@@ -1916,7 +1917,14 @@ fn is_value_column(per_column_lines: &[Vec<TextLine>], ci: usize) -> bool {
                 .any(|(_, lines)| lines.iter().any(|other| (other.y - line.y).abs() < 3.0))
         })
         .count();
-    figures * 5 >= column.len() * 4 && aligned * 5 >= column.len() * 3
+    debug!(
+        "value column check {}: {} lines, {} figures, {} aligned",
+        ci,
+        column.len(),
+        figures,
+        aligned
+    );
+    figures * 10 >= column.len() * 7 && aligned * 5 >= column.len() * 3
 }
 
 /// Split column lines into a core cluster and stragglers.
