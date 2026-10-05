@@ -181,28 +181,45 @@ fn to_napi_err(e: impl std::fmt::Display, ctx: &str) -> Error {
     Error::new(Status::GenericFailure, format!("{ctx}: {e}"))
 }
 
+/// Replace the default panic hook, which prints the panic message and its
+/// source location to stderr. A message can quote the document text being
+/// processed (a string-slicing panic includes the string), and stderr goes
+/// to container and system logs, so the hook writes one fixed line instead.
+/// The hook belongs to this module's Rust runtime only.
+fn install_quiet_panic_hook() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        panic::set_hook(Box::new(|_| {
+            eprintln!("pdf-inspector: internal error (details withheld)");
+        }));
+    });
+}
+
 /// Run a closure, catching any Rust panic and converting it to a NAPI error.
-/// Prevents process abort from unwind panics in the native module.
+/// Prevents process abort from unwind panics in the native module. The error
+/// carries a fixed message: the panic's own message can quote document text.
 fn catch_panic<F, T>(ctx: &str, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + panic::UnwindSafe,
 {
-    match panic::catch_unwind(f) {
-        Ok(result) => result,
-        Err(payload) => {
-            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            Err(Error::new(
-                Status::GenericFailure,
-                format!("{ctx}: Rust panic: {msg}"),
-            ))
-        }
-    }
+    install_quiet_panic_hook();
+    panic::catch_unwind(f).unwrap_or_else(|_| {
+        Err(Error::new(
+            Status::GenericFailure,
+            format!("{ctx}: internal error"),
+        ))
+    })
+}
+
+/// Test-only: panic while slicing `text`, the way a string-handling bug
+/// would, so `test-panic.mjs` can check that nothing of `text` escapes.
+#[cfg(feature = "panic-probe")]
+#[napi]
+pub fn panic_probe(text: String) -> Result<()> {
+    catch_panic("panic_probe", move || {
+        let cut = text.find('é').map_or(text.len() + 1, |at| at + 1);
+        Err(to_napi_err(&text[..cut], "panic_probe"))
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -11,6 +11,11 @@ pdf-inspector = { path = ".." }
 napi = { version = "3.0.0", features = ["serde-json"] }
 napi-derive = "3.0.0"
 
+[features]
+# Test-only entry point that panics on purpose (see test-panic.mjs). Never
+# enabled for release builds.
+panic-probe = []
+
 [build-dependencies]
 napi-build = "2"
 
